@@ -2,7 +2,8 @@
 
 - Date: 2026-10-20
 - Status: the user approved the design in six parts on 2026-10-20, and bench2's GPU results were folded in on
-  2026-10-21. This written spec still awaits the user's review.
+  2026-10-21. The user approved this written spec on 2026-10-21; the implementation plan is
+  `docs/superpowers/plans/2026-10-21-omnivoice-tts-inference-v0.1.md`.
 - Upstream: k2-fsa/OmniVoice @ 08be0b4, which is master HEAD on 2026-10-20 and identical in core to PyPI 0.2.1.
 - Import name `omnivoice_tts`; distribution `omnivoice-tts-inference`.
 - Line references:

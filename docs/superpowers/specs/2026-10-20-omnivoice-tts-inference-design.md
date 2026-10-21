@@ -28,7 +28,7 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 - `generate_streaming()`. It works at sentence level and needs no framework. It yields each sentence's audio together
   with the raw text that audio speaks (§7).
 - Spanish text normalization, as a step the caller runs: `TextNormalizer` (§8).
-- Optional FlashInfer (§9) and int8 (§10, experimental until the blind listening passes).
+- Optional FlashInfer (§9) and int8 (§10).
 
 **Out of v0.1**
 - Voice cloning: no reference audio, so the codec is decode-only.
@@ -77,6 +77,7 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 | 20 | The README recommends FlashInfer fp16 for a TTS that shares its GPU with an LLM | lead, from bench2 contention |
 | 21 | Neighbors on the same machine are tuned by the caller, never by the library (§11). The README lists faster-whisper in its own process (or `OPENBLAS_NUM_THREADS=1`), a high-priority CUDA stream and `TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT` | lead, from bench2 contention and soak |
 | 22 | G-TN1's pass rule is the one fixed before scoring. TN must lie in the third of the dígitos → palabras interval nearest palabras, on CER and on ok ≤ 5 %. dur/ref must be within 1.00 ± 0.03, and the CER CI against dígitos must exclude 0. TN passed | lead, from bench2 tn |
+| 23 | The blind listening passed, so int8 and FlashInfer + int8 are no longer experimental (decision #19's rule). The user heard no difference in 28 of the 29 pairs answered; the one preference went to sdpa int8 | user, 2026-10-21 (blind listening) |
 
 ## 3. Package layout
 
@@ -933,8 +934,8 @@ write US$ or USD, pre-normalize your own text, or skip TN.
     `FLASHINFER_CUDA_ARCH_LIST=12.0a` (cu128) or `12.0f` (cu129). The library never sets env vars.
 - Contract: after patching only `generate()`/`generate_streaming()` may drive the LLM. Output is not bit-identical
   to sdpa; it is judged by CER/SIM. Judged on the lib-like emulation, it is undetectable against sdpa on the 124-line
-  paired eval, on 13 metrics. Its 5 flagged endings against 2 are not detectable (p 0.25); the blind listening
-  includes A against C (block 3).
+  paired eval, on 13 metrics. Its 5 flagged endings against 2 are not detectable (p 0.25). In the blind listening
+  (block 3, A against C) the user heard no difference in the 9 pairs answered.
 - Header: keep NVIDIA's SPDX lines and add the modification notice.
 - Install (README, no pip extra): `pip install flashinfer-python==0.6.15.post1
   'flashinfer-jit-cache==0.6.15.post1+cu128' --extra-index-url https://flashinfer.ai/whl/cu128/` (cu129 analogous), a
@@ -990,9 +991,10 @@ write US$ or USD, pre-normalize your own text, or skip TN.
     against 0.0530) and +27 ms on a typical first sentence (267.5 against 240.2 ms).
   - With FlashInfer: 0.949 GiB resident with the runner (§9) and a 1.055 GiB peak (1.284 GiB at 20 s). RTF is
     0.0311-0.0312 against 0.0233-0.0239 (+31-34 %), still 1.70× faster than sdpa fp16.
-- Experimental until the blind listening passes (decision #19); not bit-identical to fp16.
+- Not bit-identical to fp16, yet no longer experimental: both checks passed (decision #23).
   - The paired fixed-seed eval passed for B and D: 124 lines, one seed, undetectable on 13 metrics.
-  - The blind listening is still open (G8 for B, G9 for D).
+  - The blind listening passed: no difference heard in 19 of 20 pairs, and int8 preferred in the other (G8 for B,
+    G9 for D).
   - A quantized model cannot be saved.
 - No fused int8 GEMM in v0.1: `torch._weight_int8pack_mm` raises NotImplementedError on CUDA in torch 2.8.0. A GEMM
   that skips the fp16 weight needs torchao or a newer torch.
@@ -1146,7 +1148,8 @@ processes apply as they are.
     - FlashInfer fp16 is the fastest, and the best neighbor for an LLM on the same GPU.
     - int8 trades 0.41 GiB for +8 % (sdpa) or +31-34 % (FlashInfer) time per call, and costs a co-located LLM more
       of its decode. Use it only when GPU memory is the constraint.
-  - Both int8 configs are experimental until the blind listening passes.
+  - Both int8 configs passed a blind listening on KohAI: no difference heard in 19 of 20 pairs, and int8 preferred
+    in the other.
 - Next to an LLM and faster-whisper on the same GPU (kohai-v3's case):
   - The processes share the GPU by time-slicing (inferred). A TTS call takes 1.12-1.34× as long while the LLM
     decodes, and the LLM keeps 23-34 % of its decode speed while the TTS runs. FlashInfer fp16 costs the LLM the
@@ -1451,14 +1454,19 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
   Emulation done (bench2): 6,272 calls per 32-step `generate()`, a 0.922 GiB peak, RTF 0.0572 (§10's forward), and
   an eval that is undetectable on 13 metrics with one seed.
 
-  Open: the blind listening (block 1, A vs B, in the listening gate below), a second seed, and the library code.
+  Blind listening done (block 1, A vs B, in the listening gate below): no difference in 9 of 10 pairs, and int8
+  preferred in the other.
+
+  Open: a second seed, and the library code.
 - G9 FlashInfer then int8: VRAM (~1.05 GiB for texts up to ~6 s), RTF, CER/SIM, and 112 Int8Linear calls per
   `model.llm` forward.
 
   Emulation done (bench2): 1.0545 GiB peak (1.284 GiB at 20 s), RTF 0.0311-0.0312, undetectable against A and
   against C, and 3,584 calls per 32-step `generate()`.
 
-  Open: the blind listening (block 2, C vs D, in the listening gate below), a second seed, and the library code.
+  Blind listening done (block 2, C vs D, in the listening gate below): no difference in 10 of 10 pairs.
+
+  Open: a second seed, and the library code.
 - G10 `use_cache=False` in the sdpa forward. Measured on upstream code: int16 PCM sha256 identical 36/36 (12 bench
   lines × 3 passes), RTF 0.0551 → 0.0514, peak allocated unchanged at 2.00 GiB. Adopted (§6). Still to do: compare
   against G1's library hashes. The lib-like A equals upstream sdpa 12/12, with the KV cache on and off.
@@ -1511,7 +1519,8 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
     - the blind set (`bench2/quality/blind/`): block 1 A vs B, block 2 C vs D and block 3 A vs C, 10 pairs each. The
       set's own `key.json` puts D in the `_x.wav` file of 8 of block 2's 10 pairs. The page re-draws the sides so
       that in each block 5 of the 10 pairs play the block's reference (A, C, A) first; its key is
-      `bench2/blind_page/key_page.json`, and the page saves the picks itself;
+      `bench2/blind_page/key_page.json`, and the page saves the picks itself. Done 2026-10-21: no difference in 28
+      of the 29 pairs answered (one pair of block 3 left blank), and sdpa int8 preferred in the other;
     - G-TN3/4's 18 takes, and G-TN2's five fastest pairs.
   - The outcome is the user's call and still open. Either it ships as designed, or the README recommends
     `pad_duration=0.05` for KohAI (a caller setting). Only if the lone short sentences sound wrong, a minimum-length
@@ -1549,9 +1558,9 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
 - The KohAI LoRA never trained with prompts (prompt_ratio_range [0,0]); prompted chunks are unvalidated (G13). Stream
   sentences are never prompted.
 - The cu128 FlashInfer route is inferred from cubins and code reading (G0).
-- int8 quality is unapproved until the blind listening passes (G8, G9); so far it is undetectable on the 124-line
-  eval with one seed. int8 is also slower on every call (+8 % on sdpa, +31-34 % on FlashInfer, with §10's forward),
-  and it costs a co-located LLM more of its decode speed.
+- int8 quality rests on one seed of the 124-line eval and one blind listening of 20 pairs (G8, G9); a second seed is
+  open. int8 is also slower on every call (+8 % on sdpa, +31-34 % on FlashInfer, with §10's forward), and it costs a
+  co-located LLM more of its decode speed.
 - Sharded checkpoints are unsupported.
 - Typos in stock voice-design words reach the model silently (user decision).
 - Base-model auto and designed voices can change between stream sentences (#255); KohAI's fine-tuned voice is fixed.

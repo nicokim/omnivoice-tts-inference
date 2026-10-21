@@ -1,7 +1,8 @@
 # omnivoice-tts-inference v0.1 design
 
 - Date: 2026-10-20
-- Status: the user approved the design in six parts on 2026-10-20. This written spec is waiting for the user's review.
+- Status: the user approved the design in six parts on 2026-10-20, and bench2's GPU results were folded in on
+  2026-10-21. This written spec still awaits the user's review.
 - Upstream: k2-fsa/OmniVoice @ 08be0b4, which is master HEAD on 2026-10-20 and identical in core to PyPI 0.2.1.
 - Import name `omnivoice_tts`; distribution `omnivoice-tts-inference`.
 - Line references:
@@ -10,7 +11,10 @@
   - `R:` is `indextts25/utils/es_rules.py` in nicokim/indextts25-inference at dfb3286f, the head of PR #6.
 - Evidence directory (outside the repo): the design session's records in
   `~/.claude/projects/-home-kimox-orca-workspaces-omnivoice-tts-inference-feat-initial-implementation/afd1a81d-ce0d-4c3f-b201-4690f4fd694d/`,
-  with `stream/` (part 3), `tn/` (part 4) and `rtf/` (GPU measurements).
+  with `stream/` (part 3), `tn/` (part 4), `rtf/` (GPU measurements, 2026-10-20) and `bench2/` (int8, FlashInfer +
+  int8, quality, TN audio, LLM contention and soak, 2026-10-21; summary in `bench2/FINAL.md`). bench2 runs upstream
+  code with the library's changes emulated ("lib-like") in four configs: A is sdpa fp16, B sdpa int8, C FlashInfer
+  fp16 and D FlashInfer + int8.
 
 ## 1. Goal, scope, success criteria
 
@@ -24,7 +28,7 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 - `generate_streaming()`. It works at sentence level and needs no framework. It yields each sentence's audio together
   with the raw text that audio speaks (§7).
 - Spanish text normalization, as a step the caller runs: `TextNormalizer` (§8).
-- Optional FlashInfer (§9) and int8 (§10).
+- Optional FlashInfer (§9) and int8 (§10, experimental until the blind listening passes).
 
 **Out of v0.1**
 - Voice cloning: no reference audio, so the codec is decode-only.
@@ -68,6 +72,11 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 | 15 | CI's test job installs the `[tn]` extra, so the PR #6 suite and the TN regression tests run on every PR (§13) | lead, from success criterion 3 |
 | 16 | ruff as in indextts25-inference; the kept upstream code is converted once to PEP 604/585 annotations (§13) | lead, from part 6 (repo infra like indextts25-inference) |
 | 17 | The es_rules copy waits for PR #6's merge, with the user's license header, so TN is the last implementation task (§8) | lead, from T6-A |
+| 18 | int8's forward stays `F.linear(x, self.qweight * self.scale, self.bias)`. It is bit-identical to slim.py's `self.q.to(x.dtype) * self.scale` and costs +8 % instead of +15 % RTF on sdpa, and +31-34 % instead of +42-46 % on FlashInfer | lead, from bench2 (2026-10-21) |
+| 19 | int8 and FlashInfer + int8 stay in v0.1, experimental until the blind listening passes. The README says when they pay and what they cost; kohai-v3 runs FlashInfer fp16 | user, 2026-10-21 |
+| 20 | The README recommends FlashInfer fp16 for a TTS that shares its GPU with an LLM | lead, from bench2 contention |
+| 21 | Neighbors on the same machine are tuned by the caller, never by the library (§11). The README lists faster-whisper in its own process (or `OPENBLAS_NUM_THREADS=1`), a high-priority CUDA stream and `TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT` | lead, from bench2 contention and soak |
+| 22 | G-TN1's pass rule is the one fixed before scoring. TN must lie in the third of the dígitos → palabras interval nearest palabras, on CER and on ok ≤ 5 %. dur/ref must be within 1.00 ± 0.03, and the CER CI against dígitos must exclude 0. TN passed | lead, from bench2 tn |
 
 ## 3. Package layout
 
@@ -91,7 +100,7 @@ Repository files:
 - Trim `docs/generation-parameters.md` and `docs/voice-design.md`; delete the rest of `docs/`, `examples/`,
   `tests/test_lora.py`, upstream `.github/`, `uv.lock`, `.pre-commit-config.yaml`, `CONTRIBUTING.md`.
 - Add `tests/test_es_normalization.py` from indextts25-inference PR #6 (§8), and `tests/data/` with the splitter's
-  hand cases and the TN tag probes (§18).
+  hand cases, the TN tag probes and int8's per-layer hashes (§18).
 - Add a repo-root `scripts/benchmark.py` (not part of the package), as in indextts25-inference.
 - Add the CI, release-please and release workflows, ruff config and a fresh `uv.lock` (§13).
 
@@ -441,7 +450,7 @@ are plain numpy arrays.
 **Global state.** None. Nothing is printed at fd level, at import or at call time. The module data is a compiled
 regex and a frozenset.
 
-**Latency and GPU time (measured 2026-10-20; G3c, G3d without the LLM).**
+**Latency and GPU time (2026-10-20 without the LLM; 2026-10-21 on lib-like builds, alone and next to it; G3c, G3d).**
 - **Setup.** RTX 5090, fp16, batch 1, 32 steps, upstream code @ 08be0b4. The stream is emulated exactly: one
   `generate()` per normalized sentence, in order, one shared RNG. A critic re-ran M0, M1 and M2 in fresh processes
   with independent code and reproduced them within ±3.5 %. Results and scripts: `rtf/FINAL.md` in the evidence
@@ -452,7 +461,9 @@ regex and a frozenset.
     it, cuBLAS switches GEMM tiles: 10.0 ms per step, rising to 14.5 ms at 21 s.
   - FlashInfer: about 3.1 ms per step up to a packed length P = L + T ≈ 320 (≈ 5.7 s), so about 0.10 s per call;
     4.8 ms per step at 10 s.
-  - RTF on the 12 bench lines: 0.0559 (sdpa) and 0.0243 (FlashInfer).
+  - RTF on the 12 bench lines: 0.0559 (sdpa) and 0.0243 (FlashInfer). On the lib-like builds (decode-only codec,
+    `use_cache=False`, CPU-first; bench2, quiet session): 0.0530 (sdpa) and 0.0233-0.0239 (FlashInfer); with int8,
+    0.0572 and 0.0311-0.0312 (§10).
 - **The stream against the whole reply,** for multi-sentence KohAI replies. The figures are corpus-weighted: a
   measured-curve model over 10,135 v8 replies, whose median error on the 77 measured calls is −2.0 % (sdpa) and −0.1 %
   (FlashInfer).
@@ -469,13 +480,28 @@ regex and a frozenset.
   - On the measured, length-stratified sample of 20 real replies, the 7 replies past sdpa's knee gain 162 ms median
     (70-229 ms).
   - FlashInfer's whole reply (104-268 ms up to 17.5 s) arrives no later than sdpa's first streamed sentence (257-270
-    ms).
+    ms). On the lib-like builds this holds up to 10.5 s (190 against 264 ms), but not at 17.5 s (288 against 259 ms;
+    bench2 perf M2).
+  - On the lib-like builds (bench2, quiet session), the medians of the first two rows (whole reply / stream) are
+    243 / 240 ms (sdpa) and 108 / 103 ms (FlashInfer).
 - **Playback never underruns.** There were 0 underruns in 20 replies × 5 reps per backend, also with TN. The minimum
   slack is 1.02 s (sdpa) and 1.18 s (FlashInfer).
 - **A sentence in flight** finishes within 0.28 s (sdpa) or about 0.13 s (FlashInfer) for sentences up to 7.2 s.
   Longer ones take more: 0.17 s on FlashInfer at 9.8 s, and at 32 steps about 0.43 / 0.24 s at 15 s and 0.49 / 0.30 s
   at 20 s (sdpa / FlashInfer), so about 0.46 s on sdpa for KohAI's longest sentence (17.1 s). There is no per-step
   cancel in v0.1; add one when a measured barge-in needs it.
+- **Next to the LLM** (G3d with llama-server running kohai-v3's model, argv and request shape; bench2, with C and D
+  re-run by the critic).
+  - While llama-server decodes back to back, one call takes 1.12× as long on sdpa and 1.23× on FlashInfer (median).
+    With int8: 1.31× on FlashInfer with §10's forward, and 1.16× (sdpa) and 1.34× (FlashInfer) with slim.py's.
+  - Meanwhile the LLM keeps 34 % (sdpa) and 31 % (FlashInfer) of its decode speed, and 23-24 % with int8.
+  - The contention is on the GPU. The TTS thread's CPU dispatch stays within 2 % of alone on fp16 at 1.5-5 s (A and
+    C). On D, and on B and C at 7 s, it grows along with the GPU time, because launches block once the GPU falls
+    behind. The two processes most likely time-slice the GPU (inferred; no MPS daemon ran).
+  - The real pipeline ran 20 KohAI replies through `_split_sentences` on the token stream, with one TTS thread and
+    no TN. First audio came at 579 ms (sdpa) and 428 ms (FlashInfer) median, p90 681 / 510 ms.
+  - That first audio is the LLM's first sentence (≈ 0.30 s) plus one TTS call; the handoff takes 0.1 ms.
+  - There were 0 underruns in 41 later sentences, with a minimum slack of 0.69-0.85 s.
 - **Single-sentence replies.** The item is bit-identical to `generate()` (50/50 reps per backend) and takes the same
   time.
 - **TN** with the pickled grammar: the first sentence takes 7.6 ms, against 17.2 ms for a whole 2-sentence reply. A
@@ -485,14 +511,16 @@ regex and a frozenset.
   startup removes it.
 - **What it means.**
   - Within one text, sentence streaming brings the first audio forward only for long texts. For typical KohAI replies
-    it gains 4-16 ms and costs about 2× the TTS time.
+    it gains 4-16 ms and costs about 2× the TTS time. FlashInfer + int8, GPU-bound almost from the start, is the
+    exception: it gains 30 ms median, yet its first sentence (119 ms) still comes after FlashInfer fp16's whole reply
+    (108 ms).
   - What matters more is the backend (FlashInfer is about 2.5× faster on short sentences) and overlapping TTS with
     the LLM. Feeding each sentence as the LLM finishes it, as Pipecat's sentence aggregation does, makes each call
-    usually one item. The README says so.
+    usually one item. The README says so. Measured next to the LLM (above), that overlap brings the first audio in
+    before the LLM alone would finish the median reply (0.66 s).
 - **Not measured.**
-  - The LLM sharing the GPU and CPU (G3d). A launch-bound TTS is sensitive to CPU and GIL contention.
   - The library's own code (G3a, G3b).
-  - The LLM-overlap gain, which is still an estimate.
+  - TN on the TTS thread while the LLM decodes (G-TN6), and close or cancel under contention (G3e).
   - FlashInfer CUDA-graph buckets, and 16 steps on real replies.
 
 **CPU proof** (stream critic)
@@ -825,8 +853,9 @@ write US$ or USD, pre-normalize your own text, or skip TN.
 **Duration, chunking, streaming**
 - The caller computes any duration on the normalized text. Raw text weighs a median 0.931 of the hand-reviewed spoken
   form; normalized text weighs 1.000 (measured).
-- Normalized Spanish has no digits left (0 on 34,090 sentences), so `generate()`'s >30 s chunker cannot split inside
-  `21:30` or `1,000`.
+- Normalized Spanish has no digits left on the KohAI corpus (0 on 34,090 sentences), so there `generate()`'s >30 s
+  chunker cannot split inside `21:30` or `1,000`. On the 485 held-out number sentences, 2 keep digits: NeMo returns
+  `localhost:5000` unchanged, and `10²` stays.
 - `generate_streaming(normalize=tn.normalize)` normalizes each raw sentence, computes the duration on the spoken text
   and yields the raw sentence as the subtitle (§7). It skips a sentence that TN empties.
 - With `generate()`, the caller checks the normalized text before calling: `generate()` raises ValueError on text with
@@ -866,11 +895,20 @@ write US$ or USD, pre-normalize your own text, or skip TN.
 - **Two-thread logging,** above.
 - **Same-uid trust.** Any pickle the user owns and nobody else can write is trusted. On Windows the cache is never
   trusted, so every start rebuilds.
-- **Hidden NeMo failures.** NeMo's internal failures return the raw segment, and their warning goes to DEBUG. None was
-  seen in about 41,000 calls.
+- **Hidden NeMo failures.** NeMo's internal failures return the raw segment, and their warning goes to DEBUG. One was
+  seen in G-TN1: a sentence containing `localhost:5000` comes back unchanged, while "apunte a 5000" alone is
+  normalized.
 - **Locale.** The es-AR conventions apply to all 'es' text.
-- **No audio eval yet.** TextNormalizer's output has not been rendered on the current KohAI checkpoint (G-TN1). The
-  text proxy CER is 0.023, and the training labels are exactly this normalizer's output.
+- **Audio eval (G-TN1, passed narrowly).** 485 held-out number sentences were rendered on v5r2b_576 with the KohAI
+  duration rule on the normalized text.
+  - TN scores CER 0.029, 82 % ok ≤ 5 % and dur/ref 0.99. Hand-written words score 0.013 / 93 %, and raw digits
+    0.065 / 53 %.
+  - The model reads TN's text with CER 0.008, so the gap is in the text.
+  - 88 sentences miss ok ≤ 5 %, 34 of them with hand-written words too. Of the other 54, 34 hit real TN errors or
+    gaps (hand labels): symbols such as `>`, `¥` and `√`, `N+`, `00:00`, m:ss timestamps, units such as mAh and
+    kcal, abbreviations such as lvl and s. XVIII, and Roman numerals. At least 10 more hide among the shared misses,
+    such as codes read as cardinals, "5° C", Roman numerals and `localhost:5000`.
+  - Per the ownership rule above, those fixes land in indextts25-inference first.
 
 ## 9. FlashInfer (`models/omnivoice_flashinfer.py`)
 
@@ -881,18 +919,22 @@ write US$ or USD, pre-normalize your own text, or skip TN.
   dtype follows the model (fp16/bf16; fp32 rejected).
 - No attention registry and no `set_attn_implementation`: the patched attention calls the wrapper directly;
   `attention_mask={'full_attention': None}` skips mask building; `use_cache=False` is passed at the call site.
-- Fusion: bias-free `nn.Linear` `qkv_proj` and `gate_up_proj` built on meta from `torch.cat` weights; the originals
-  are deleted (frees 587,202,560 B).
+- Fusion: bias-free `nn.Linear` `qkv_proj` and `gate_up_proj` built on meta from `torch.cat` weights, computed under
+  `torch.no_grad()`; the originals are deleted (frees 587,202,560 B). With an autograd graph, the fused tensor
+  (`CatBackward0`) keeps q/k/v/gate/up alive and the deletion frees 0 B. That is upstream's case, measured.
 - Deleted from upstream: CUDA graphs and buckets, the doc_slots SDPA branch, the stats hook, the unfused branch, every
   kwarg.
 - RNG: `_generate_iterative_packed(self, task, gen_config, generator=None)`, same signature as sdpa.
 - Guards before patching:
   - CUDA available and fp16/bf16, else ValueError;
-  - `q_proj` an `nn.Linear`, else TypeError ("call it before apply_int8");
+  - `q_proj` an `nn.Linear`, else TypeError ("call it before apply_int8"), where upstream fails with
+    `AttributeError: 'Int8Linear' object has no attribute 'weight'`;
   - non-empty `flashinfer.jit.current_compilation_context.TARGET_CUDA_ARCHS`, else a RuntimeError naming
     `FLASHINFER_CUDA_ARCH_LIST=12.0a` (cu128) or `12.0f` (cu129). The library never sets env vars.
 - Contract: after patching only `generate()`/`generate_streaming()` may drive the LLM. Output is not bit-identical
-  to sdpa; it is judged by CER/SIM.
+  to sdpa; it is judged by CER/SIM. Judged on the lib-like emulation, it is undetectable against sdpa on the 124-line
+  paired eval, on 13 metrics. Its 5 flagged endings against 2 are not detectable (p 0.25); the blind listening
+  includes A against C (block 3).
 - Header: keep NVIDIA's SPDX lines and add the modification notice.
 - Install (README, no pip extra): `pip install flashinfer-python==0.6.15.post1
   'flashinfer-jit-cache==0.6.15.post1+cu128' --extra-index-url https://flashinfer.ai/whl/cu128/` (cu129 analogous), a
@@ -907,19 +949,53 @@ write US$ or USD, pre-normalize your own text, or skip TN.
     version deletes them (G6).
   - Upstream's own per-length CUDA graphs cut a 1.5 s call from 103 to 61 ms. Each new length costs a 0.26-0.39 s
     capture call, though, so without buckets they lose on unique sentences. They stay out, as decided in part 5.
+- Measured on the lib-like emulation (bench2: CPU-first, deletion, decode-only codec, `use_cache=False`; cu129 +
+  12.0f).
+  - Memory: 1.358 GiB with the runner (sdpa's 1.225 plus its 136 MiB). The emulation allocated the runner at build;
+    the library allocates it on the first plan, so expect 1.225 GiB after the build and 1.366 GiB after the warm-up
+    call. The peak is 1.464 GiB on the bench lines (G6's estimate holds) and 1.693 GiB at a 20 s text. nvidia-smi
+    shows 2,154 MiB after M0.
+  - Speed: RTF 0.0233-0.0239, and the cold first call takes 0.605-0.614 s.
+  - Patching on the GPU instead leaves 0.57 GiB of reserved holes that `empty_cache` cannot release: 1.932 GiB
+    reserved against 1.366 GiB allocated, and 2,608 against 2,090 MiB of nvidia-smi. Hence the CPU-first recipe, and
+    a runner that allocates on the first plan.
 
 ## 10. int8 (`models/omnivoice_int8.py`)
 
-- `Int8Linear`: symmetric int8 weight, one scale per output channel `amax.clamp_min(1e-8) * (1 / 127)` in the weight's
-  dtype (CPU and CUDA quantize identically and equal slim.py's GPU weights). `forward` is
-  `F.linear(x, self.qweight * self.scale, self.bias)`.
+- `Int8Linear`: symmetric int8 weight, one scale per output channel, computed in fp32 and stored in the weight's
+  dtype. With `w = weight.float()`: `s = w.abs().amax(1, keepdim=True).clamp_min(1e-8) * (1 / 127)`,
+  `qweight = torch.round(w / s).to(torch.int8)` and `scale = s.to(weight.dtype)`.
+  - Computed this way, CPU and CUDA quantize identically and equal slim.py's `int8_layers` run on CUDA: 0 of
+    440,401,920 values differ.
+  - slim.py writes `/ 127`, which CUDA runs as the multiplication above. On the CPU it is a true division, and 3,209
+    values differ.
+- `forward` is `F.linear(x, self.qweight * self.scale, self.bias)`, as one expression, never slim.py's
+  `self.q.to(x.dtype) * self.scale`.
+  - Both give bit-identical PCM.
+  - slim.py's form launches two kernels per Linear instead of one: +392 instead of +196 kernels per `model.llm`
+    forward on sdpa.
+  - It costs +15 % instead of +8 % RTF on sdpa, and +42-46 % instead of +31-34 % on FlashInfer.
 - `apply_int8(model) -> model`: converts every `nn.Linear` under `model.llm.layers` (196 for Qwen3); audio heads,
   embeddings, norms, rotary buffers and codec untouched; idempotent; no knobs. After FlashInfer it converts the fused
-  layers too (quantize-then-fuse equals fuse-then-quantize, CPU-verified).
-- Recipe: `from_pretrained(dtype=fp16)` on CPU, `apply_int8(model)`, `.to("cuda:0")`: about 0.82 GiB resident and
-  0.92 GiB peak, no transient, no `empty_cache`.
-- Experimental: not bit-identical to fp16; adoption needs the paired fixed-seed eval and listening (G8). A quantized
-  model cannot be saved.
+  layers too: 112 modules (qkv, o, gate_up and down × 28), each called at every step.
+  - That is 3,584 calls per 32-step `generate()`, and 0 into an `nn.Linear`.
+  - Quantize-then-fuse equals fuse-then-quantize: CPU-verified, and the per-layer sha256 is the same for both layouts.
+  - This relies on the vendored layout. Upstream FlashInfer followed by slim.py reports 196 Int8Linear, yet two thirds
+    of the weights it reads stay fp16. So checks count forward calls, not modules.
+- Recipe: `from_pretrained(dtype=fp16)` on CPU, `apply_int8(model)`, `.to("cuda:0")`. It needs no `empty_cache`, and
+  the load has no transient.
+  - Memory: 0.816 GiB resident. The peak is 0.922 GiB for texts up to ~6 s and 1.151 GiB at 20 s (nvidia-smi
+    1,612 / 1,872 MiB).
+  - Against fp16 it saves 0.41 GiB (402-422 MiB of nvidia-smi, 382 at a 20 s text). It costs +8 % RTF (0.0572
+    against 0.0530) and +27 ms on a typical first sentence (267.5 against 240.2 ms).
+  - With FlashInfer: 0.949 GiB resident with the runner (§9) and a 1.055 GiB peak (1.284 GiB at 20 s). RTF is
+    0.0311-0.0312 against 0.0233-0.0239 (+31-34 %), still 1.70× faster than sdpa fp16.
+- Experimental until the blind listening passes (decision #19); not bit-identical to fp16.
+  - The paired fixed-seed eval passed for B and D: 124 lines, one seed, undetectable on 13 metrics.
+  - The blind listening is still open (G8 for B, G9 for D).
+  - A quantized model cannot be saved.
+- No fused int8 GEMM in v0.1: `torch._weight_int8pack_mm` raises NotImplementedError on CUDA in torch 2.8.0. A GEMM
+  that skips the fp16 weight needs torchao or a newer torch.
 
 ## 11. Process-global state contract
 
@@ -940,6 +1016,10 @@ write US$ or USD, pre-normalize your own text, or skip TN.
 `_quiet_nemo` (§8). Around the library's own NeMo calls, `_quiet_nemo` adds a filter to NeMo's logger, then removes it
 and restores the level that NeMo's `normalize()` resets to INFO. The net change is none when calls do not overlap in
 time; two instances normalizing concurrently can leave NeMo's logger at INFO (measured).
+
+Neighbors on the same machine are the caller's to tune (decision #21): the library sets no thread counts and creates
+no CUDA streams. Its GPU work runs on the caller's current stream, so §15's high-priority stream and separate
+processes apply as they are.
 
 **Residual effects of dependencies** (README "Global state" list)
 - numpy/torch warnings filters at import.
@@ -985,6 +1065,8 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
 - kohai-v3 adoption:
   - it drops its `transformers==4.52.1`, `indextts25-inference[flash]` and `flash-attn` pins;
   - it declares `omnivoice-tts-inference[tn]`;
+  - for FlashInfer fp16 (decision #19), it adds §9's two pinned FlashInfer wheels from FlashInfer's index and sets
+    `FLASHINFER_CUDA_ARCH_LIST` at launch, since there is no pip extra;
   - its `pynini>=2.1.7` override is optional, and its comment is wrong, since 2.1.6.post1 has cp313 wheels. Keeping it
     gives the faster stack it runs today; dropping it silences `uv pip check`.
 
@@ -1027,15 +1109,21 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
   - tags, and the fact that any `[...]` passes through, digits included;
   - the cache, its security and prebuilding;
   - threads and the GIL;
-  - "compute any duration on the normalized text".
+  - "compute any duration on the normalized text": with the rule on the raw text, KohAI speaks 6.5 % faster (20 %
+    on a third of number sentences), and the most skewed sentence becomes unintelligible;
+  - what G-TN1 measured, and the known gaps: symbols, `N+`, `00:00`, timestamps, units, abbreviations, Roman
+    numerals and codes read as cardinals. Rephrase or pre-normalize such text; `localhost:5000` and `10²` keep their
+    digits.
 - Streaming:
   - the item contract and the player-thread and asyncio patterns: one worker thread, and `TTS.submit(stream.close)` in
     `finally`;
   - what it buys, from §7's measurements. With the whole reply in hand at sdpa, the first audio of a typical KohAI
     reply comes only ≈ 4 ms (≈ 14 ms with TN) before `generate()`'s, at ≈ 2× the TTS time. Items still give
     subtitles, a cancel point at each sentence and overlap with the LLM when the caller feeds sentences. When latency
-    matters, use FlashInfer: first audio in ≈ 0.10 s, and a whole reply of up to ≈ 17 s arrives before sdpa's first
-    sentence;
+    matters, use FlashInfer: first audio in ≈ 0.10 s, and a whole reply of up to ≈ 10 s arrives before sdpa's first
+    sentence. When the caller feeds sentences from a streaming LLM as they finish, as kohai-v3 does, the first audio
+    comes at the LLM's first sentence plus one call: 0.43 s (FlashInfer) and 0.58 s (sdpa), median, measured next
+    to the LLM;
   - put laughs at the start of a sentence;
   - strip markdown and list markers from LLM output before streaming ("1. Pizza" splits like a sentence);
   - base-model auto and designed voices vary between sentences (#255);
@@ -1043,8 +1131,39 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
   - `pad_duration` and `fade_duration` are the only join knobs;
   - the difference from PR #166, which yields cumulative audio plus a status; this stream yields each sentence's audio
     plus its text.
-- FlashInfer and int8 recipes, with the RTF/VRAM table marked "measured on upstream code, to re-measure" until G4-G9
-  run on the library, plus the warm-up call at startup.
+- FlashInfer and int8 recipes, plus the warm-up call at startup. Their table is marked "measured on an emulation of
+  the library, to re-measure" until G4-G9 run on the library code (bench2, RTX 5090, 32 steps; resident includes
+  the FlashInfer runner):
+
+  | | resident GiB | peak GiB, ≤ 6 s / 20 s text | nvidia-smi MiB | RTF | first sentence of a typical reply |
+  |---|---|---|---|---|---|
+  | sdpa fp16 | 1.23 | 1.33 / 1.56 | 2,014 | 0.053 | 240 ms |
+  | sdpa int8 | 0.82 | 0.92 / 1.15 | 1,612 | 0.057 | 268 ms |
+  | FlashInfer fp16 | 1.36 | 1.46 / 1.69 | 2,154 | 0.023-0.024 | 103 ms |
+  | FlashInfer + int8 | 0.95 | 1.05 / 1.28 | 1,754 | 0.031 | 119 ms |
+
+  - When to use which:
+    - FlashInfer fp16 is the fastest, and the best neighbor for an LLM on the same GPU.
+    - int8 trades 0.41 GiB for +8 % (sdpa) or +31-34 % (FlashInfer) time per call, and costs a co-located LLM more
+      of its decode. Use it only when GPU memory is the constraint.
+  - Both int8 configs are experimental until the blind listening passes.
+- Next to an LLM and faster-whisper on the same GPU (kohai-v3's case):
+  - The processes share the GPU by time-slicing (inferred). A TTS call takes 1.12-1.34× as long while the LLM
+    decodes, and the LLM keeps 23-34 % of its decode speed while the TTS runs. FlashInfer fp16 costs the LLM the
+    least per sentence.
+  - Run faster-whisper in its own process. Under back-to-back transcription with the LLM idle, a TTS call then
+    takes 1.11-1.21× as long, against 2.5-2.9× on a thread of the TTS process; next to a decoding LLM this was not
+    measured.
+  - If it must share the TTS process, a sentence that overlaps an utterance takes 1.2-1.5× as long with default
+    settings. Under back-to-back transcription, `OPENBLAS_NUM_THREADS=1` in the launch environment or a
+    high-priority CUDA stream for the TTS brings 2.5-2.9× down to 2.0-2.4× (sdpa and FlashInfer fp16, each alone;
+    the two were not measured together).
+  - Keep CPU-heavy Python work out of the TTS process.
+  - These are caller settings; the library sets none (§11).
+- Host memory: the codec decoder's cuDNN execution plans grow host RSS by about 0.7 MiB per new target length.
+  - The growth is bounded, at about 320 MiB over every length from 1 to 20 s.
+  - `TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT`, a caller setting for the launch environment, caps it: with 270, it costs
+    +0.02-0.21 ms per call.
 - Threads and the global-state contract (§6, §7, §8, §11).
 - "Never .half()".
 - Numbered differences from upstream, including:
@@ -1065,6 +1184,7 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
   from omnivoice_tts.utils.text import TextNormalizer
 
   model = OmniVoice.from_pretrained("kohai-channel/kohai-omni-tts", device_map="cuda:0", dtype=torch.float16)
+  # sdpa keeps this short. Next to an LLM on the same GPU, use FlashInfer fp16 (the recipe above), as kohai-v3 does.
   tn = TextNormalizer(cache_dir=os.path.expanduser("~/.cache/kohai/omnivoice-tn"))  # one per TTS thread
   # Load the prebuilt grammar now, not in a reply. A process that builds it itself stays ~4x slower at TN
   # (py3.12, pynini 2.1.6.post1).
@@ -1127,7 +1247,8 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
 - `generate()`'s >30 s chunker can split inside '21:30', '3.5' or '1,000' at a chunk boundary: upstream's
   `chunk_text_punctuation` splits at every . , ; : ! ? without a whitespace check. `generate_streaming`'s splitter
   never does, though a stream sentence above 30 s still goes through this chunker. Spanish text normalized first has
-  no digits left to split (§8).
+  no digits left to split on the KohAI corpus; 2 of the 485 held-out number sentences keep them (`localhost:5000`,
+  `10²`; §8).
 - 'Sra.' is missing from `ABBREVIATIONS`, which `generate()`'s >30 s chunker uses. The stream splitter has its own
   Spanish list (§7).
 - A short, boosted chunk 0 inflates later chunks when `audio_chunk_duration` is lowered.
@@ -1159,7 +1280,8 @@ time; two instances normalizing concurrently can leave NeMo's logger at INFO (me
   - kwargs with a generation_config;
   - chunked text with duration or speed (fix 10). This includes a short text whose duration exceeds 30 s, which
     upstream also chunks;
-  - FlashInfer against sdpa, and int8 against fp16;
+  - FlashInfer against sdpa, and int8 against fp16 (the two int8 forward forms of §10 are bit-identical to each
+    other on the 12 bench lines);
   - streaming of multi-sentence text (§7).
 
 ## 18. Tests (CPU, in the repo; upstream outputs frozen as fixtures)
@@ -1168,7 +1290,8 @@ Files: `tests/test_loader.py` (loader), `tests/test_generate.py` (call sequences
 `tests/test_split_sentences.py`, `tests/test_streaming.py`, `tests/test_text_normalizer.py` (every TN test except the
 PR #6 suite), `tests/test_es_normalization.py` (the PR #6 suite), `tests/test_int8.py`, `tests/test_flashinfer_cpu.py`.
 Fixtures go in `tests/data/`, copied from the evidence directory: the splitter's 68 hand cases
-(`stream/scratch/segmenter/scripts/cases.py`) and the 109 tag probes (`tn/scratch/tn-critic/out/inputs_probes.json`).
+(`stream/scratch/segmenter/scripts/cases.py`), the 109 tag probes (`tn/scratch/tn-critic/out/inputs_probes.json`) and
+int8's per-layer sha256 list (`bench2/perf/raw/listen_B.json` `int8.per_layer_sha256`, 28 layers × 8 hashes).
 
 **Loader**
 - `test_loader_matches_transformers_from_pretrained`: a tiny Qwen3 OmniVoice; parameters, buffers and the 2-row CFG
@@ -1258,9 +1381,19 @@ duration=45 s). `test_from_pretrained_rejects_upstream_kwargs` includes `attn_im
 - `*test_es_rules_is_the_indextts25_copy`: the sha256 pin.
 
 **Optional modules**
-- `test_int8.py`: round-trip bound ≤ 0.63·scale, scope, idempotence, equals slim.py.
-- `test_flashinfer_cpu.py`: skipped without flashinfer; HOME/TMPDIR in a temp dir; fusion frees the originals, 4
-  Linears per layer, the guards leave the model untouched, the ImportError text, FlashInfer then int8.
+- `test_int8.py`: round-trip bound ≤ 0.63·scale (0.561 measured on KohAI), scope, idempotence, the formula, equals
+  slim.py.
+  - On a tiny model, `qweight` and `scale` equal `round(w.float() / s)` and `s.to(dtype)`, with `s` computed in fp32
+    as §10 says.
+  - "Equals slim.py" means slim.py run on CUDA. slim.py's `int8_layers` on the CPU is not a valid reference: it
+    differs in 3,209 values on KohAI.
+  - When the KohAI checkpoint is cached, the per-layer sha256 list equals bench2's `perf/raw/listen_B.json`
+    `int8.per_layer_sha256` (top-level d8e4b4726f65…, hashed as in bench2's `perf/perf.py`).
+  - Do not use f0dfc9af…: that is slim.py run on CPU.
+- `test_flashinfer_cpu.py`: skipped without flashinfer; HOME/TMPDIR in a temp dir; fusion frees the originals and the
+  fused weights have no `grad_fn`, 4 Linears per layer, the guards leave the model untouched, the ImportError text,
+  FlashInfer then int8 (4 Int8Linear per layer, and no fused weight left as a plain tensor attribute; G9 counts the
+  forward calls on the GPU).
 
 **GPU** end-to-end tests are gated by environment variables; `scripts/benchmark.py`.
 
@@ -1280,29 +1413,71 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
   patching.
 - G1 default parity: int16 PCM sha256 against upstream, step by step (loader, codec, global-state removals, str-only
   plumbing, generator threading, MODEL_MAPPING), on the 12 bench lines (KohAI duration rule), 2 newline-free texts over
-  30 s (duration=None) and 1 CJK text.
+  30 s (duration=None) and 1 CJK text. The reference is upstream run on the KohAI export (`kohai-omni-tts-fp16`), never
+  the model card's eval wavs. Those come from an in-memory fp16 merge that differs from the export in 196 tensors (by
+  at most 0.00195), so 0/124 match.
 - G2 private generator == global seed; CUDA RNG untouched with a private generator; a CPU generator raises.
 - G4 sdpa memory and latency on the library: the load peak without the 806 MB transient; ~1.33 GiB at 32 steps;
   reserved; nvidia-smi next to llama-server and faster-whisper; load time; RTF at 32 and 16 steps. Upstream's loader
   measured 1.89 GiB after load and 2.24 GiB peak on real replies, and RTF 0.0559 at 32 steps (§7) with the KV cache
-  on. With `use_cache=False` upstream measured 0.0514 (G10), the library's expected figure.
+  on. With `use_cache=False` and the decode-only codec, the lib-like emulation measures 0.0530-0.0535 in three fresh
+  processes, the library's expected figure. G10's 0.0514 came from one 3-pass process.
+
+  Emulation done (bench2):
+  - 1.3313 GiB M0 peak and 1.561 GiB at 20 s, with no load transient;
+  - nvidia-smi 2,014 MiB alone, and a 24,211 MiB GPU total next to llama-server and faster-whisper;
+  - load to ready 0.87 s, cold call 0.54 s.
+
+  Open: the library code.
 - G5 FlashInfer parity with upstream FlashInfer (eager) and isolation (two FI instances alternating, plus one sdpa).
+  Emulation done (bench2): C built CPU-first equals upstream FlashInfer patched on the GPU 12/12, and C in the
+  vendored module layout equals C 12/12. Open: the library code and the isolation check.
 - G6 FlashInfer memory with the CPU-first recipe. Expect a peak of about 1.46 GiB allocated, against 2.01 GiB for
   upstream FlashInfer with a decode-only codec (INSTRUCTIVO.md) and a 2.92 GiB peak (2.57 GiB after load and patch)
-  with upstream's full loader (§9).
+  with upstream's full loader (§9). Emulation done (bench2): 1.4641 GiB on the bench lines (the estimate holds) and
+  1.693 GiB at 20 s. Patching on the GPU instead leaves 1.932 GiB reserved against 1.366 GiB allocated. Open: the
+  library code.
 - G7 FlashInfer CER/SIM against sdpa, RTF on the library (upstream: 0.0243 at 32 steps), and cold start (CuTe-DSL
-  RMSNorm JIT; upstream's first call took 0.65-0.89 s).
-- G8 int8: equals slim.py's int8_layers (196 qweight/scale tensors, same PCM hash); VRAM; RTF; paired fixed-seed eval
-  on 124 lines; blind listening (adoption gate).
-- G9 FlashInfer then int8: VRAM (~1.05 GiB), RTF, CER/SIM.
+  RMSNorm JIT; upstream's first call took 0.65-0.89 s). Emulation done (bench2): undetectable against sdpa on the
+  124-line eval (13 metrics); RTF 0.0233-0.0239; cold call 0.605-0.614 s. Open: the library code.
+- G8 int8: the checks are
+  - equality with slim.py's `int8_layers` run on CUDA: 196 modules, 392 qweight/scale tensors, the per-layer
+    sha256 list named in §18 and the same PCM hash;
+  - forward calls counted, not modules: 196 per `model.llm` forward;
+  - VRAM and RTF;
+  - the paired fixed-seed eval on 124 lines;
+  - the blind listening (the adoption gate).
+
+  Emulation done (bench2): 6,272 calls per 32-step `generate()`, a 0.922 GiB peak, RTF 0.0572 (§10's forward), and
+  an eval that is undetectable on 13 metrics with one seed.
+
+  Open: the blind listening (block 1, A vs B, in the listening gate below), a second seed, and the library code.
+- G9 FlashInfer then int8: VRAM (~1.05 GiB for texts up to ~6 s), RTF, CER/SIM, and 112 Int8Linear calls per
+  `model.llm` forward.
+
+  Emulation done (bench2): 1.0545 GiB peak (1.284 GiB at 20 s), RTF 0.0311-0.0312, undetectable against A and
+  against C, and 3,584 calls per 32-step `generate()`.
+
+  Open: the blind listening (block 2, C vs D, in the listening gate below), a second seed, and the library code.
 - G10 `use_cache=False` in the sdpa forward. Measured on upstream code: int16 PCM sha256 identical 36/36 (12 bench
   lines × 3 passes), RTF 0.0551 → 0.0514, peak allocated unchanged at 2.00 GiB. Adopted (§6). Still to do: compare
-  against G1's library hashes.
-- G11 silence and global state on GPU (fd-level capture; env, filters, logging, default dtype, CUDA RNG).
-- G12 concurrency with faster-whisper on another thread.
+  against G1's library hashes. The lib-like A equals upstream sdpa 12/12, with the KV cache on and off.
+- G11 silence and global state on GPU (fd-level capture; env, filters, logging, default dtype, CUDA RNG, torch thread
+  counts).
+- G12 concurrency with faster-whisper on another thread. Emulation done (bench2 contention). The TTS call slows by:
+  - 1.21-1.51× with one transcription per call;
+  - 2.49-2.89× with transcriptions back to back;
+  - 3.31-3.51× with the LLM decoding as well;
+  - 1.11-1.21× with faster-whisper in its own process.
+
+  The cost is on the CPU side: dispatch runs 1.9-2.7× slower. The outcome is README advice (§15), not library
+  code.
 - G13, by ear before the release: `generate()` on 2-3 KohAI texts over 30 s with the KohAI duration rule (fix 10
   changes nothing when duration and speed are None). Render each with fix 10 and with upstream's timing for chunks ≥ 1
   (`speed=speed`); chunks ≥ 1 are prompted. If the ear prefers upstream's timing, D6 goes back to the user.
+- G14 soak: 1,000 calls per config. Emulation done (bench2 soak): no GPU memory growth, no drift, 100/100
+  determinism and 0 errors. Host RSS grows +157-160 MiB from cuDNN plans (bounded, §15). Open: the library code, an
+  hours-long run and a soak next to the LLM.
 
 **Streaming** (G3 is split into G3a-G3e)
 - G3a single-sentence parity on the library code, on sdpa fp16 and on FlashInfer (about 1 min).
@@ -1319,7 +1494,10 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
 - G3c step cost against length, sdpa and FlashInfer. Done (§7): flat per-step cost, launch-bound at short lengths;
   the knee is at L > 320 on sdpa and at P ≈ 320 on FlashInfer.
 - G3d time to first item and GPU time per reply on real replies, sdpa and FlashInfer, with the TN grammar warm. Done
-  without the LLM (§7). Still open: the same while llama-server is decoding, with the LLM's tok/s during TTS.
+  without the LLM (§7) and next to llama-server (bench2, with no TN in the pipeline): the TTS takes 1.12-1.34× per
+  call (1.31× for D with §10's forward), the LLM keeps 23-34 % of its decode, the real pipeline's first audio comes
+  at 428-638 ms (medians, A-D; B and D ran slim.py's int8 forward), and there are 0 underruns. Open: TN on the TTS
+  thread next to the LLM (G-TN6), and the library code.
 - G3e close and cancel on the real model. After `close()` following the first item, the next stream reproduces its
   solo hashes. The asyncio pattern (one worker thread, `close()` queued on it) works under `task.cancel()`.
 - Listening, a release gate approved with part 3: the user listens before the release.
@@ -1327,6 +1505,14 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
     sentences with the 1.0 s floor; optionally `pad_duration` 0.05 against 0.1.
   - The first two sets are rendered on both backends: 13 wavs each, in `rtf/scratch/listen/{sdpa,fi}/` of the evidence
     directory and on a private listening page.
+  - New sets (bench2), on the private listening page:
+    - the int8 takes of the same replies and short sentences (`bench2/perf/listen/{sdpa_int8,fi_int8}/`, 13 wavs
+      each);
+    - the blind set (`bench2/quality/blind/`): block 1 A vs B, block 2 C vs D and block 3 A vs C, 10 pairs each. The
+      set's own `key.json` puts D in the `_x.wav` file of 8 of block 2's 10 pairs. The page re-draws the sides so
+      that in each block 5 of the 10 pairs play the block's reference (A, C, A) first; its key is
+      `bench2/blind_page/key_page.json`, and the page saves the picks itself;
+    - G-TN3/4's 18 takes, and G-TN2's five fastest pairs.
   - The outcome is the user's call and still open. Either it ships as designed, or the README recommends
     `pad_duration=0.05` for KohAI (a caller setting). Only if the lone short sentences sound wrong, a minimum-length
     merge; until then it stays under §7's "Not in v0.1".
@@ -1335,15 +1521,21 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
 - G-TN1 (main). Normalize the 485 held-out number sentences (work/numbers/test.jsonl) with
   `TextNormalizer(cache_dir).normalize(digits, 'es')` and render them through v5r2b_576 with the existing num_eval.sh /
   render_eval.py / score_asr_sim.py / num_score.py pipeline, with the KohAI duration rule on the normalized text. Pass
-  if CER and ok≤5% are close to the 'palabras' arm (0.013, 93 %, dur/ref 1.00) and far from 'dígitos' (0.065, 53 %,
-  0.93).
+  if CER and ok ≤ 5 % are close to the 'palabras' arm (0.013, 93 %, dur/ref 1.00) and far from 'dígitos' (0.065,
+  53 %, 0.93). Done (bench2 tn, with PR #6's TN, whose output equals TextNormalizer's on these 485). It passed by the
+  rule of decision #22: CER 0.0287 and ok ≤ 5 % 81.9 % lie 0.30 and 0.28 of the way from 'palabras' to 'dígitos'
+  (the limit is 1/3), and dur/ref is 0.990.
 - G-TN2 (duration basis). Render the same normalized text with dur(raw) and with dur(normalized), to confirm in audio
-  the 0.938 median timing skew behind the "no flag" decision.
+  the 0.938 median timing skew behind the "no flag" decision. Done: the raw-text rule gives audio 0.942× as long and
+  speech 6.5 % faster (20 % in the third of sentences more than 10 % short). SIM drops by 0.0075 and CER is
+  unchanged; the most skewed sentence breaks (CER 0.425).
 - G-TN3 (listening: tags next to numbers). '[laughter]21:30 arrancamos.', 'Costó $2.800[sigh], ¿viste?', 'Tengo 21
   [laughter] años.' (read as veintiuno) and '¿En serio?[question-ah] ¡Tenés 31 años!': each tag is voiced and the
-  number sounds natural.
+  number sounds natural. Rendered (3 seeds each): in Whisper's transcripts the numbers are right 12/12, and
+  `[question-ah]` is voiced 3/3. The laughs and the sigh need the ear. Open: listening.
 - G-TN4 (pronunciation overrides after TN). 'Ese [B EY1 S] cuesta $450.' and '[HH AH0 L OW1] chat, son las 9:05.':
-  the override still applies and the number is spoken.
+  the override still applies and the number is spoken. Rendered (3 seeds each): in Whisper's transcripts the numbers
+  are right 6/6, and both overrides apply 3/3. Open: listening.
 - G-TN5 (long text). A Spanish text over 30 s with many numbers: normalized and then through `generate()`, and raw
   through `generate_streaming(normalize=tn.normalize)`. No chunk boundary falls inside a number reading, and the stream
   items carry the raw sentences.
@@ -1357,14 +1549,24 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
 - The KohAI LoRA never trained with prompts (prompt_ratio_range [0,0]); prompted chunks are unvalidated (G13). Stream
   sentences are never prompted.
 - The cu128 FlashInfer route is inferred from cubins and code reading (G0).
-- int8 quality is unapproved (G8).
+- int8 quality is unapproved until the blind listening passes (G8, G9); so far it is undetectable on the 124-line
+  eval with one seed. int8 is also slower on every call (+8 % on sdpa, +31-34 % on FlashInfer, with §10's forward),
+  and it costs a co-located LLM more of its decode speed.
 - Sharded checkpoints are unsupported.
 - Typos in stock voice-design words reach the model silently (user decision).
 - Base-model auto and designed voices can change between stream sentences (#255); KohAI's fine-tuned voice is fixed.
-- Up to about 10.6 s (sdpa) or 5.7 s (FlashInfer) of audio, a call costs a fixed floor set by CPU dispatch (on sdpa
-  the GPU idles below about 5 s), so CPU and GIL contention from the LLM process can slow it. That is not measured yet
-  (G3d).
+- Up to about 10.6 s (sdpa) or 5.7 s (FlashInfer) of audio, an fp16 call costs a fixed floor set by CPU dispatch.
+  With int8 the GPU becomes the limit sooner: past about 7.6 s on sdpa, and almost from the start on FlashInfer.
+  - Next to llama-server that floor holds: dispatch stays within 2 % of alone (A and C, 1.5-5 s).
+  - The two processes most likely time-slice the GPU instead (inferred; no MPS daemon ran). A TTS call takes
+    1.12-1.34× as long, and the LLM keeps 23-34 % of its decode speed while they overlap (G3d, measured).
+  - The CPU-side risk is inside the TTS process. faster-whisper on a thread costs 1.2-1.5× per overlapping call and
+    2.5-2.9× back to back (G12), and a busy pure-Python thread was once seen starving it (not verified).
+- Host RSS grows with each new target length (cuDNN plans for the codec decoder), bounded at about 320 MiB (§15).
+- GPU-bound timings depend on the session: the desktop's graphics load moved them by up to 9 % between bench2
+  sessions. Ratios within one session hold.
 - The two es_rules copies can drift until indextts25-inference stops owning the file (§8).
-- Spanish TN follows es-AR conventions for all 'es' text, and its audio effect on the KohAI checkpoint is not measured
-  yet (G-TN1).
+- Spanish TN follows es-AR conventions for all 'es' text. In audio it passes G-TN1 narrowly: CER 0.029, against
+  0.013 for hand-written words. At least 44 of 485 held-out number sentences hit real TN errors or gaps, and 2 keep
+  digits (§8).
 - The `[tn]` extra needs a C compiler and adds about 0.7 GB; it is Linux x86_64 and CPython < 3.14 only.

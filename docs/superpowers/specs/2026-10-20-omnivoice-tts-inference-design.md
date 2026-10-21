@@ -66,7 +66,7 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 | 9 | Part 6 approved: repo infra like indextts25-inference; licenses; tests; GPU check list. KohAI card relabelled cc-by-nc-4.0 (commit 499a9c55) | user |
 | 10 | Unknown language raises ValueError. The double-speed fix for chunks ≥ 1 is in (fix 10); G13 checks it by ear before the release | lead, approved with part 3 |
 | 11 | Keep pydub (bit-identity); document its warnings | lead, approved with part 2 |
-| 12 | Part 3 approved: sentence-level `generate_streaming` with `normalize=` and a callable `duration=`, yielding `(audio, raw sentence)`; independent sentences; `str` input only. The user listens to the stream before the release (§19); the outcome is pending | user |
+| 12 | Part 3 approved: sentence-level `generate_streaming` with `normalize=` and a callable `duration=`, yielding `(audio, raw sentence)`; independent sentences; `str` input only. The user listens to the stream before the release (§19); it passed (decision #24) | user |
 | 13 | Part 4 approved: caller-held `TextNormalizer`; Spanish only (NeMo plus the copied PR #6 rules); no `normalize_text=` flag; opt-in guarded grammar cache; errors propagate; the stream skips sentences that normalization empties | user |
 | 14 | `use_cache=False` in the sdpa forward is adopted: G10 measured PCM-identical output (36/36) and 6.7 % lower RTF on upstream code | rule from part 6 ("if identical, adopt"), measured 2026-10-20 |
 | 15 | CI's test job installs the `[tn]` extra, so the PR #6 suite and the TN regression tests run on every PR (§13) | lead, from success criterion 3 |
@@ -78,6 +78,7 @@ indextts25-inference's API: there is no facade, no `synthesize`/`warm`/`Chunk`.
 | 21 | Neighbors on the same machine are tuned by the caller, never by the library (§11). The README lists faster-whisper in its own process (or `OPENBLAS_NUM_THREADS=1`), a high-priority CUDA stream and `TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT` | lead, from bench2 contention and soak |
 | 22 | G-TN1's pass rule is the one fixed before scoring. TN must lie in the third of the dígitos → palabras interval nearest palabras, on CER and on ok ≤ 5 %. dur/ref must be within 1.00 ± 0.03, and the CER CI against dígitos must exclude 0. TN passed | lead, from bench2 tn |
 | 23 | The blind listening passed, so int8 and FlashInfer + int8 are no longer experimental (decision #19's rule). The user heard no difference in 28 of the 29 pairs answered; the one preference went to sdpa int8 | user, 2026-10-21 (blind listening) |
+| 24 | The listening gate passed: the stream, the lone short sentences and G-TN3/4's takes sounded right, so streaming ships as designed, with no `pad_duration=0.05` advice and no minimum-length merge | user, 2026-10-21 |
 
 ## 3. Package layout
 
@@ -1522,9 +1523,8 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
       `bench2/blind_page/key_page.json`, and the page saves the picks itself. Done 2026-10-21: no difference in 28
       of the 29 pairs answered (one pair of block 3 left blank), and sdpa int8 preferred in the other;
     - G-TN3/4's 18 takes, and G-TN2's five fastest pairs.
-  - The outcome is the user's call and still open. Either it ships as designed, or the README recommends
-    `pad_duration=0.05` for KohAI (a caller setting). Only if the lone short sentences sound wrong, a minimum-length
-    merge; until then it stays under §7's "Not in v0.1".
+  - Done 2026-10-21 (decision #24): everything sounded right to the user, so it ships as designed. The README does
+    not recommend `pad_duration=0.05`, and the minimum-length merge stays under §7's "Not in v0.1".
 
 **Text normalization**
 - G-TN1 (main). Normalize the 485 held-out number sentences (work/numbers/test.jsonl) with
@@ -1541,10 +1541,10 @@ later call in the same process (+26 % on sdpa, +14 % on FlashInfer, measured).
 - G-TN3 (listening: tags next to numbers). '[laughter]21:30 arrancamos.', 'Costó $2.800[sigh], ¿viste?', 'Tengo 21
   [laughter] años.' (read as veintiuno) and '¿En serio?[question-ah] ¡Tenés 31 años!': each tag is voiced and the
   number sounds natural. Rendered (3 seeds each): in Whisper's transcripts the numbers are right 12/12, and
-  `[question-ah]` is voiced 3/3. The laughs and the sigh need the ear. Open: listening.
+  `[question-ah]` is voiced 3/3. The user heard the laughs and the sigh right (2026-10-21).
 - G-TN4 (pronunciation overrides after TN). 'Ese [B EY1 S] cuesta $450.' and '[HH AH0 L OW1] chat, son las 9:05.':
   the override still applies and the number is spoken. Rendered (3 seeds each): in Whisper's transcripts the numbers
-  are right 6/6, and both overrides apply 3/3. Open: listening.
+  are right 6/6, and both overrides apply 3/3. The user heard them right (2026-10-21).
 - G-TN5 (long text). A Spanish text over 30 s with many numbers: normalized and then through `generate()`, and raw
   through `generate_streaming(normalize=tn.normalize)`. No chunk boundary falls inside a number reading, and the stream
   items carry the raw sentences.

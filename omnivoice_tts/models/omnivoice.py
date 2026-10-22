@@ -54,7 +54,7 @@ from omnivoice_tts.utils.audio import (
     remove_silence,
 )
 from omnivoice_tts.utils.duration import RuleDurationEstimator
-from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAMES
+from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID, LANG_NAMES
 from omnivoice_tts.utils.text import chunk_text_punctuation
 from omnivoice_tts.utils.voice_design import (
     _INSTRUCT_EN_TO_ZH,
@@ -797,23 +797,22 @@ class OmniVoice(PreTrainedModel):
 
 
 def _resolve_language(language: str | None) -> str | None:
-    from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
+    """Return the language ID for an ID or a name, or ``None`` for language-agnostic mode.
 
+    ``None`` and ``"none"`` give ``None``. Otherwise IDs, then names, are matched case-insensitively and
+    without stripping whitespace. Anything else raises ``ValueError`` (upstream warned and used ``None``).
+    """
     if language is None or language.lower() == "none":
         return None
-    if language in LANG_IDS:
-        return language
     key = language.lower()
+    if key in LANG_IDS:
+        return key
     if key in LANG_NAME_TO_ID:
         return LANG_NAME_TO_ID[key]
-    logger.warning(
-        f"Language '{language}' is not recognized. "
-        f"Please use a valid language ID (e.g., 'en', 'zh', 'ja', 'de') "
-        f"or a full language name (e.g., 'English', 'Chinese', 'Japanese'). "
-        f"See supported_language_ids() or supported_language_names() for details. "
-        f"Falling back to None (language-agnostic mode)."
+    raise ValueError(
+        f"unknown language {language!r}: use a language ID (e.g. 'es', 'en', 'zh') from supported_language_ids() "
+        "or a language name (e.g. 'Spanish') from supported_language_names()"
     )
-    return None
 
 
 def _resolve_instruct(

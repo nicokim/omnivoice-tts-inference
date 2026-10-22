@@ -114,3 +114,16 @@ def test_kwargs_override_generation_config():
     rec, cfg = Recorder(), OmniVoiceGenerationConfig(num_step=32)
     run("Hola.", {"generation_config": cfg, "num_step": 16}, rec)
     assert rec.configs[0].num_step == 16 and cfg.num_step == 32
+
+
+@pytest.mark.parametrize("language", ["castellano", "Klingon", "es-AR", " es "])  # P7: no strip, as upstream
+def test_unknown_language_raises(language):
+    rec = Recorder()
+    with pytest.raises(ValueError, match="supported_language_ids"):
+        run("Hola.", {"language": language}, rec)
+    assert rec.calls == []
+
+
+def test_language_id_case_insensitive():
+    assert [ov._resolve_language(x) for x in ("ES", "es", "Spanish")] == ["es", "es", "es"]
+    assert all(ov._resolve_language(x) == out for x, out, accepted in UP["language"] if accepted)

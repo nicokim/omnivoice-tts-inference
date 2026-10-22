@@ -150,3 +150,13 @@ def test_forward_requires_attention_mask():
     out = m(input_ids, audio_mask, attention_mask)
     assert out.logits.shape == (2, 8, 40, 1025)
     assert seen[0]["use_cache"] is False
+
+
+def test_text_without_speech_raises():
+    for text, kwargs in [("", {}), ("   ", {}), ("...", {}), ("😀", {}), ("¿?", {}), ("", {"duration": 40.0})]:
+        rec = Recorder()
+        with pytest.raises(ValueError, match="nothing to speak"):
+            run(text, kwargs, rec)
+        assert rec.calls == []
+    stub = stub_model(OmniVoice, RuleDurationEstimator(), Recorder())
+    assert len(stub.generate("[laughter]")) == 1  # a tag alone is speech

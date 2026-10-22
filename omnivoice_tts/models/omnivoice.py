@@ -501,6 +501,8 @@ class OmniVoice(PreTrainedModel):
     ) -> GenerationTask:
         if not isinstance(text, str):
             raise TypeError(f"text must be a str, got {type(text).__name__}")
+        if not any(c.isalnum() for c in text):
+            raise ValueError(f"text has nothing to speak: {text!r}")
         language = _resolve_language(language)
         instruct = None if instruct is None else _resolve_instruct(instruct, use_zh=bool(_ZH_RE.search(text)))
 

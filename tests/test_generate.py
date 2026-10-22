@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,7 +10,7 @@ from conftest import tiny_model
 from stubs import Recorder, stub_model
 
 import omnivoice_tts.models.omnivoice as ov
-from omnivoice_tts.models.omnivoice import OmniVoice
+from omnivoice_tts.models.omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice_tts.utils.duration import RuleDurationEstimator
 
 UP = json.loads((Path(__file__).parent / "data/upstream_08be0b4.json").read_text(encoding="utf-8"))
@@ -91,3 +92,11 @@ def test_generate_end_to_end_on_tiny_model():
     a, b = outs
     assert len(a) == 1 and a[0].dtype == np.float32 and a[0].shape == (45120,)  # 42 frames x 960 + 2 x 2400 pad
     assert np.array_equal(a[0], b[0])
+
+
+def test_near_silent_output_returns_empty():
+    quiet = (np.random.default_rng(0).standard_normal((1, 24000)) * 1e-4).astype(np.float32)
+    stub = stub_model(OmniVoice, RuleDurationEstimator(), Recorder())
+    assert stub._post_process_audio(quiet, OmniVoiceGenerationConfig()).shape == (1, 0)
+    stub.audio_tokenizer.decode = lambda t: SimpleNamespace(audio_values=torch.from_numpy(quiet)[None])
+    assert stub.generate("Hola.")[0].shape == (0,)

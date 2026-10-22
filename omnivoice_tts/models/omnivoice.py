@@ -432,7 +432,9 @@ class OmniVoice(PreTrainedModel):
                 trail_sil=100,
             )
 
-        peak = np.abs(generated_audio).max()
+        # initial=0.0: remove_silence returns an empty clip when everything is below -50 dBFS, and max() of
+        # nothing raises (upstream crashed here)
+        peak = np.abs(generated_audio).max(initial=0.0)
         if peak > 1e-6:
             generated_audio = generated_audio / peak * 0.5
 

@@ -1,3 +1,4 @@
+# Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4
 import warnings
 from importlib.metadata import PackageNotFoundError, version
 

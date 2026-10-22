@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
+# Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4
 #
 # See ../../LICENSE for clarification regarding multiple authors
 #
@@ -25,7 +26,6 @@ using character phonetic weights across 600+ languages. Used by
 import bisect
 import unicodedata
 from functools import lru_cache
-from typing import Optional
 
 
 class RuleDurationEstimator:
@@ -210,7 +210,7 @@ class RuleDurationEstimator:
         target_text: str,
         ref_text: str,
         ref_duration: float,
-        low_threshold: Optional[float] = 50,
+        low_threshold: float | None = 50,
         boost_strength: float = 3,
     ) -> float:
         """

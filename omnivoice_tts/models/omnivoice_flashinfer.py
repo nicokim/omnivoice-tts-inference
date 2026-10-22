@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4
 """FlashInfer-accelerated iterative decoding for OmniVoice.
 
 Approach (mirrors CosyVoice/runtime/triton_trtllm/token2wav_dit_flashinfer.py):
@@ -29,7 +30,6 @@ Usage:
 import math
 import time
 from types import MethodType
-from typing import List
 
 import flashinfer
 import torch
@@ -197,7 +197,7 @@ class PackedAttnRunner:
         )
         self._planned_key = None
 
-    def plan(self, doc_lens: List[int], dtype: torch.dtype):
+    def plan(self, doc_lens: list[int], dtype: torch.dtype):
         key = (tuple(doc_lens), dtype)
         if key == self._planned_key:
             return
@@ -221,7 +221,7 @@ class PackedAttnRunner:
 
 def _generate_iterative_packed(
     self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     """Packed-sequence rewrite of OmniVoice._generate_iterative.
 
     Documents are packed as [cond_0, uncond_0, cond_1, uncond_1, ...] into a
@@ -275,8 +275,8 @@ def _generate_iterative_packed(
         total_len = B * (C_b + U_b)
     else:
         offsets = [0]
-        for l in doc_lens[:-1]:
-            offsets.append(offsets[-1] + l)
+        for n in doc_lens[:-1]:
+            offsets.append(offsets[-1] + n)
         total_len = sum(doc_lens)
 
     C = self.config.num_audio_codebook
@@ -488,7 +488,7 @@ def _get_or_capture_graph(model, doc_lens_key, tgt_index):
     # positions are fully determined by doc_lens (the cache key), so both the
     # long buffer (model-level rotary) and the int32 copy (fused rope) can be
     # baked with their final values
-    positions = torch.cat([torch.arange(l, device=device) for l in doc_lens_key])
+    positions = torch.cat([torch.arange(n, device=device) for n in doc_lens_key])
     static = {
         "input_ids": torch.full(
             (1, C, total_len),

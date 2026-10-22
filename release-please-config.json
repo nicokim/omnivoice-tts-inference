@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "c055cfd52576fd234dff0bfe73892ea5750db4da",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "omnivoice-tts-inference",
+      "include-component-in-tag": false,
+      "extra-files": ["omnivoice_tts/__init__.py"]
+    }
+  }
+}

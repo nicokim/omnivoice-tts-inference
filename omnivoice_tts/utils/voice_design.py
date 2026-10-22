@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
+# Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4
 #
 # See ../../LICENSE for clarification regarding multiple authors
 #

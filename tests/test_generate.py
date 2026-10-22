@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,8 +87,9 @@ def test_generate_chunked_matches_upstream(case):
 
 def test_duration_estimator_matches_upstream():
     est = RuleDurationEstimator()
-    for text, weight, dur in UP["duration"]:
-        assert est.calculate_total_weight(text) == weight and est.estimate_duration(text, "Nice to meet you.", 25) == dur
+    for text, weight, dur in UP["duration"]:  # isclose: libm's pow may differ in the last bit on another machine
+        assert math.isclose(est.calculate_total_weight(text), weight, rel_tol=1e-12), text
+        assert math.isclose(est.estimate_duration(text, "Nice to meet you.", 25), dur, rel_tol=1e-12), text
 
 
 def test_combine_text_unchanged_without_newlines():
@@ -116,7 +118,7 @@ def test_language_accepted_like_upstream():
 @pytest.mark.parametrize("text", [["Hola."], b"Hola.", None, 3])
 def test_list_text_raises_typeerror(text):
     rec = Recorder()
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="text must be a str"):
         run(text, {}, rec)
     assert rec.calls == []
 

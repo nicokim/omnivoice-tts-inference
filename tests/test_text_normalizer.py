@@ -176,6 +176,14 @@ def test_cache_loads_only_own_private_pickle(tmp_path, monkeypatch):  # no NeMo
     assert list(cache.iterdir()) == []  # its .tmp file is gone too
 
 
+def test_normalization_errors_propagate(capfd):  # no NeMo
+    tn = text.TextNormalizer()
+    tn._es = types.SimpleNamespace(normalize=lambda t, verbose: 1 / 0)  # a grammar that fails on every text
+    with pytest.raises(ZeroDivisionError):
+        tn.normalize("Tengo 2 gatos.", "es")
+    assert capfd.readouterr() == ("", "")  # fix 12: upstream warned on stderr and spoke the raw text
+
+
 SILENT = """
 import logging, os, sys, warnings
 import nemo_text_processing.text_normalization.normalize  # the app imports NeMo, then sets its logger

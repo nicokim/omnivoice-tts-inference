@@ -6,7 +6,7 @@ import torch
 from stubs import Recorder, stub_model
 
 import omnivoice_tts.models.omnivoice as ov
-from omnivoice_tts.models.omnivoice import OmniVoice
+from omnivoice_tts.models.omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice_tts.utils.duration import RuleDurationEstimator
 
 # One sentence of about 57 s by the rule (1,437 frames, past audio_chunk_threshold), which the stub sees as 5 calls.
@@ -158,17 +158,34 @@ def test_lone_tag_is_spoken():
     assert np.array_equal(items[0][0], stub()[0].generate("[laughter]")[0])
 
 
-def test_skips_sentences_tn_empties():
+@pytest.mark.parametrize("empty", ["", " ", ".", "😀"])
+def test_skips_sentences_tn_empties(empty):
     durations = []
     m, rec = stub(draw=True)
     g, g2 = torch.Generator().manual_seed(4), torch.Generator().manual_seed(4)
     items = list(m.generate_streaming("Hola. <3. Chau.", "es", generator=g,
-                                      normalize=lambda t, lang: "" if t == "<3." else t,
+                                      normalize=lambda t, lang: empty if t == "<3." else t,
                                       duration=lambda spoken: durations.append(spoken) or 1.0))
     assert [s for _, s in items] == ["Hola.", "Chau."] and len(rec.calls) == 2 and durations == ["Hola.", "Chau."]
     assert same([a for a, _ in items], [m.generate(s, "es", duration=1.0, generator=g2)[0] for s in ("Hola.", "Chau.")])
     m, rec = stub()
-    assert list(m.generate_streaming("Hola. <3. Chau.", "es", normalize=lambda t, lang: "")) == [] and rec.calls == []
+    assert list(m.generate_streaming("Hola. <3. Chau.", "es", normalize=lambda t, lang: empty)) == []
+    assert rec.calls == []
+
+
+def test_arguments_reach_every_sentence():
+    def targets(speed):
+        m, rec = stub()
+        for s in ("Hola.", "¿Qué tal?"):
+            m.generate(s, "es", speed=speed)
+        return [c[2] for c in rec.calls]
+
+    m, rec = stub()
+    items = list(m.generate_streaming("Hola. ¿Qué tal?", "es", instruct="Female", speed=2.0, num_step=8,
+                                      generation_config=OmniVoiceGenerationConfig(guidance_scale=1.5)))
+    assert len(items) == 2 and [c[4] for c in rec.calls] == [["female"], ["female"]]
+    assert [c[2] for c in rec.calls] == targets(2.0) == [[t[0] // 2] for t in targets(1.0)]  # generate()'s, halved
+    assert all(c.num_step == 8 and c.guidance_scale == 1.5 for c in rec.configs) and len(rec.configs) == 2
 
 
 @pytest.mark.parametrize("text", [["Hola."], b"Hola.", None, 3])

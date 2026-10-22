@@ -328,9 +328,9 @@ class OmniVoice(PreTrainedModel):
                 num_step: Number of iterative decoding steps.
                 guidance_scale: Classifier-free guidance scale.
                 t_shift: Time-step shift (smaller → emphasise low-SNR).
-                postprocess_output: Remove silences longer than 500 ms and trim
-                    the edges to 100 ms; peak normalization to 0.5 and the
-                    fade/pad always run.
+                postprocess_output: Shorten pauses longer than 1 s to 1 s and
+                    trim leading and trailing silence to 100 ms. Peak
+                    normalization to 0.5 and the fade/pad always run.
                 layer_penalty_factor: Penalty encouraging earlier codebook
                     layers to unmask first.
                 position_temperature: Temperature for position selection.

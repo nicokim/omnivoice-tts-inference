@@ -935,8 +935,9 @@ def _combine_text(text, ref_text: str | None = None) -> str:
     else:
         full_text = text.strip()
 
-    # filter out newline / carriage-return characters
-    full_text = re.sub(r"[\r\n]+", "", full_text)
+    # a run of newline / carriage-return characters becomes one space (upstream deleted it, so "a.\nb" read "a.b");
+    # the rules below collapse the spaces and drop any left between Chinese characters
+    full_text = re.sub(r"[\r\n]+", " ", full_text)
 
     # replace Chinese parentheses with English ones
     full_text = full_text.replace("\uff08", "(").replace("\uff09", ")")

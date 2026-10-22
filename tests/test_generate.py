@@ -40,6 +40,12 @@ def test_combine_text_unchanged_without_newlines():
     assert all(ov._combine_text(t, r) == out for t, r, out in UP["combine_text"])
 
 
+def test_newline_becomes_space():
+    assert ov._combine_text("Hola che.\nTodo bien?") == "Hola che. Todo bien?"
+    assert ov._combine_text("a\r\n\r\nb") == "a b"
+    assert ov._combine_text("你好\n世界") == "你好世界"
+
+
 def test_instruct_normalised_like_upstream_and_never_rejected():
     for s, zh, out, rejected in UP["instruct"]:
         got = ov._resolve_instruct(s, use_zh=zh)  # never raises

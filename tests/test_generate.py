@@ -25,10 +25,63 @@ def run(text, kwargs, rec=None):
     return rec, stub_model(OmniVoice, RuleDurationEstimator(), rec).generate(text, **kwargs)[0]
 
 
-@pytest.mark.parametrize("case", UP["calls"] + UP["chunked"])
+def case_id(case):
+    return f"{len(case['text'])}chars-" + ",".join(f"{k}={v}" for k, v in case["kwargs"].items())
+
+
+# Fix 10 moves the later chunks of every text upstream split into several calls with a speed or a duration;
+# _assert_fix10 covers those, and every other case stays identical to upstream.
+PARITY = [
+    c
+    for c in UP["calls"] + UP["chunked"]
+    if not (len(c["calls"]) > 1 and {"speed", "duration"} & c["kwargs"].keys())
+]
+
+
+def chunked_with(field):
+    """The frozen cases upstream split into several calls, with ``field`` (speed or duration) among the kwargs."""
+    return [c for c in UP["calls"] + UP["chunked"] if len(c["calls"]) > 1 and field in c["kwargs"]]
+
+
+def _assert_fix10(case):
+    """Same first call and chunk texts as upstream, but every later chunk is timed from chunk 0 at speed 1.0.
+
+    Chunk 0's length already carries the speed and the later chunks are estimated from its rate, so upstream
+    divided by the speed a second time.
+    """
+    rec = Recorder()
+    m = stub_model(OmniVoice, RuleDurationEstimator(), rec)
+    m.generate(case["text"], **case["kwargs"])
+    frozen = case["calls"]
+    assert rec.calls[0] == frozen[0]
+    assert [c[1] for c in rec.calls] == [c[1] for c in frozen]
+    t0, n0 = rec.calls[0][1][0], rec.calls[0][2][0]
+    for call, old in zip(rec.calls[1:], frozen[1:]):
+        assert call[2] == [m._estimate_target_tokens(call[1][0], t0, n0, speed=1.0)]
+        assert call[2] != old[2]
+
+
+@pytest.mark.parametrize("case", PARITY, ids=case_id)
 def test_generate_matches_upstream_call_sequence(case):
     rec, out = run(case["text"], case["kwargs"])
     assert rec.calls == case["calls"] and sha(out) == case["pcm_sha256"] and len(out) == case["n_samples"]
+
+
+@pytest.mark.parametrize("case", chunked_with("speed"), ids=case_id)
+def test_later_chunks_not_sped_up_twice(case):
+    _assert_fix10(case)
+
+
+PLAIN_CHUNKED = [c for c in UP["chunked"] if not {"speed", "duration"} & c["kwargs"].keys()]
+
+
+@pytest.mark.parametrize("case", PLAIN_CHUNKED + chunked_with("duration"), ids=case_id)
+def test_generate_chunked_matches_upstream(case):
+    if "duration" in case["kwargs"]:
+        _assert_fix10(case)
+    else:
+        rec, out = run(case["text"], case["kwargs"])
+        assert rec.calls == case["calls"] and sha(out) == case["pcm_sha256"] and len(out) == case["n_samples"]
 
 
 def test_duration_estimator_matches_upstream():

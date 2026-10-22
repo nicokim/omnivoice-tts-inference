@@ -474,12 +474,14 @@ class OmniVoice(PreTrainedModel):
             sub_task = GenerationTask(
                 batch_size=1,
                 texts=[chunk],
+                # chunk 0's length already carries the speed, and later chunks are timed from its rate, so they
+                # use 1.0 (upstream divided by the speed a second time)
                 target_lens=[
                     self._estimate_target_tokens(
                         chunk,
                         ref_text,
                         ref_tokens.size(-1) if ref_tokens is not None else None,
-                        speed=speed,
+                        speed=1.0 if tokens else speed,
                     )
                 ],
                 langs=task.langs,

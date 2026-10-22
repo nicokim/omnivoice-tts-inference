@@ -54,6 +54,11 @@ def main():
 
     from omnivoice_tts import OmniVoice, __version__
 
+    if a.backend == "flashinfer":  # imported before the timed load, like torch and omnivoice_tts
+        from omnivoice_tts.models.omnivoice_flashinfer import apply_flashinfer
+    if a.int8:
+        from omnivoice_tts.models.omnivoice_int8 import apply_int8
+
     gen = {"num_step": a.steps}
     torch.cuda.synchronize()  # creates the CUDA context outside the timed load
     torch.cuda.reset_peak_memory_stats()
@@ -63,12 +68,8 @@ def main():
     else:
         model = OmniVoice.from_pretrained(a.model, dtype=torch.float16)
         if a.backend == "flashinfer":
-            from omnivoice_tts.models.omnivoice_flashinfer import apply_flashinfer
-
             apply_flashinfer(model)
         if a.int8:
-            from omnivoice_tts.models.omnivoice_int8 import apply_int8
-
             apply_int8(model)
         model.to("cuda:0")
     torch.cuda.synchronize()

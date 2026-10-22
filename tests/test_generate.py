@@ -127,3 +127,9 @@ def test_unknown_language_raises(language):
 def test_language_id_case_insensitive():
     assert [ov._resolve_language(x) for x in ("ES", "es", "Spanish")] == ["es", "es", "es"]
     assert all(ov._resolve_language(x) == out for x, out, accepted in UP["language"] if accepted)
+
+
+def test_audio_chunk_duration_zero_disables_split():
+    text = UP["chunked"][0]["text"]
+    assert len(run(text, {"audio_chunk_duration": 0.0})[0].calls) == 1
+    assert len(run(text, {})[0].calls) > 1

@@ -359,7 +359,7 @@ class OmniVoice(PreTrainedModel):
 
         task = self._preprocess_all(text, language, instruct, duration, speed)
 
-        if task.target_lens[0] > int(
+        if gen_config.audio_chunk_duration > 0 and task.target_lens[0] > int(
             gen_config.audio_chunk_threshold * self.audio_tokenizer.config.frame_rate
         ):
             tokens = self._generate_chunked(task, gen_config)

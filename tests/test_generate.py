@@ -100,3 +100,17 @@ def test_near_silent_output_returns_empty():
     assert stub._post_process_audio(quiet, OmniVoiceGenerationConfig()).shape == (1, 0)
     stub.audio_tokenizer.decode = lambda t: SimpleNamespace(audio_values=torch.from_numpy(quiet)[None])
     assert stub.generate("Hola.")[0].shape == (0,)
+
+
+def test_unknown_generate_kwarg_raises_typeerror():
+    for extra in ({}, {"generation_config": OmniVoiceGenerationConfig()}):
+        rec = Recorder()
+        with pytest.raises(TypeError):
+            run("Hola.", {"num_steps": 8, **extra}, rec)
+        assert rec.calls == []
+
+
+def test_kwargs_override_generation_config():
+    rec, cfg = Recorder(), OmniVoiceGenerationConfig(num_step=32)
+    run("Hola.", {"generation_config": cfg, "num_step": 16}, rec)
+    assert rec.configs[0].num_step == 16 and cfg.num_step == 32

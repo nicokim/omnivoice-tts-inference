@@ -31,7 +31,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -84,12 +84,6 @@ class OmniVoiceGenerationConfig:
     audio_chunk_threshold: float = 30.0
     pad_duration: float = 0.1
     fade_duration: float = 0.1
-
-    @classmethod
-    def from_dict(cls, kwargs_dict):
-        valid_keys = {f.name for f in fields(cls)}
-        filtered = {k: v for k, v in kwargs_dict.items() if k in valid_keys}
-        return cls(**filtered)
 
 
 @dataclass
@@ -325,9 +319,11 @@ class OmniVoice(PreTrainedModel):
                 Overrides ``speed`` when both are provided.
             speed: Speaking speed factor. ``> 1.0`` for faster, ``< 1.0`` for
                 slower. ``None`` (default) uses the model's default estimation.
-            generation_config: Explicit config object. If provided, takes
-                precedence over ``**kwargs``.
-            **kwargs: Generation config or its fields:
+            generation_config: Base config, ``OmniVoiceGenerationConfig()`` by
+                default. It is not modified: ``**kwargs`` override its fields
+                on a copy.
+            **kwargs: Fields of ``OmniVoiceGenerationConfig``; an unknown name
+                raises ``TypeError``:
                 denoise: Whether to prepend the ``<|denoise|>`` token.
                 num_step: Number of iterative decoding steps.
                 guidance_scale: Classifier-free guidance scale.
@@ -357,11 +353,7 @@ class OmniVoice(PreTrainedModel):
                 "Model is not loaded with audio/text tokenizers. Make sure you "
                 "loaded the model with OmniVoice.from_pretrained()."
             )
-        gen_config = (
-            generation_config
-            if generation_config is not None
-            else OmniVoiceGenerationConfig.from_dict(kwargs)
-        )
+        gen_config = replace(generation_config or OmniVoiceGenerationConfig(), **kwargs)
 
         self.eval()
 

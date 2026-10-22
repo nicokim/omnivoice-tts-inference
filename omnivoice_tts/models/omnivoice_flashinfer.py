@@ -190,7 +190,9 @@ def _generate_iterative_packed(
 
     Documents are packed as [cond_0, uncond_0, cond_1, uncond_1, ...] into a
     single batch row; the scoring/unmasking math is identical to the original,
-    and at batch 1 the Gumbel noise is drawn with the same shapes and order.
+    and at batch 1 the Gumbel noise is drawn with the same shapes and order,
+    except on steps where no token is unmasked: the original skips both draws
+    there, this one still makes them.
     """
     B = task.batch_size
     inputs_list = [

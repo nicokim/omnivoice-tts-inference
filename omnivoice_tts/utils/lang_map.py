@@ -25,7 +25,6 @@ Provides ``LANG_NAME_TO_ID`` (for resolving language names to codes) and
 ``OmniVoice.generate()`` to resolve user-provided language names.
 """
 
-# Auto-generated from docs/lang_id_name_map.tsv
 # Maps lowercase language name -> language ID code
 
 LANG_NAME_TO_ID = {

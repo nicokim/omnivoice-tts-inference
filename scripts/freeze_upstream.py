@@ -1,8 +1,8 @@
 """Freeze upstream k2-fsa/OmniVoice's behavior into the JSON fixture that the tests compare the library against.
 
-Run it in the reference venv, where upstream is installed editable as ``omnivoice``:
+Run it with ``UP`` and ``REV`` set, in a venv where upstream 08be0b4 is installed editable as ``omnivoice``:
 
-    . ./.plan-env.sh && "$KV" -I -B scripts/freeze_upstream.py tests/data/upstream_08be0b4.json
+    python -I -B scripts/freeze_upstream.py tests/data/upstream_08be0b4.json
 
 It runs upstream's own ``omnivoice`` package, never ``omnivoice_tts``, and reads ``UP`` (the upstream clone) and
 ``REV`` (the commit it must be at) from the environment. ``-I`` ignores PYTHONHASHSEED, so two runs that write the
@@ -102,8 +102,9 @@ def freeze_duration():
 
 
 def freeze_instruct():
-    # The design session's equiv_check recipe: upstream's own vocabulary in pairs, with the separators, the case and
-    # the padding mangled, plus the KohAI words. EDGE is new. Sets are sorted: their order depends on hashing.
+    # Upstream's own vocabulary: for every pair of its categories, each of the first three items of one with each of
+    # the first three of the other, joined as "x, y", "X，y" (upper case, full-width comma) and " x ,y," (padding, a
+    # trailing comma); then every item alone, the KohAI words and EDGE. Sets are sorted: their order depends on hashing.
     cats =[list(c.keys()) + list(c.values()) if isinstance(c, dict) else sorted(c) for c in vd._INSTRUCT_CATEGORIES]
     cases = []
     for a, b in itertools.combinations(range(len(cats)), 2):

@@ -240,9 +240,9 @@ class OmniVoice(PreTrainedModel):
                 The codec goes to CPU when the model is on MPS.
             dtype: ``None`` means the config's dtype (and the checkpoint's own dtypes when the config
                 names none). RoPE's ``inv_freq`` stays fp32 and the codec keeps its checkpoint dtype.
-            revision, token, cache_dir, local_files_only: Passed to ``snapshot_download``, also for the
-                codec fallback (``eustlb/higgs-audio-v2-tokenizer`` at a pinned revision) that a repo
-                without ``audio_tokenizer/`` uses.
+            revision, token, cache_dir, local_files_only: Passed to ``snapshot_download``. A repo without
+                ``audio_tokenizer/`` falls back to ``eustlb/higgs-audio-v2-tokenizer`` at a pinned revision;
+                that download gets ``token``, ``cache_dir`` and ``local_files_only``, not ``revision``.
 
         The checkpoint is a single ``model.safetensors`` (sharded ones are not supported); its keys must
         match the model exactly.
@@ -1050,7 +1050,6 @@ def _combine_text(text, ref_text: str | None = None) -> str:
     return full_text
 
 
-# ---- module level, next to _combine_text
 # A run of . ! ? … plus closing quotes/brackets, then whitespace, the end or a non-verbal tag; or 。！？.
 _SENTENCE_END = re.compile(r"[.!?…]+[\"'”’»)\]]*(?:\s+|$|(?=\[))|[。！？]+[”’」』）]*\s*")
 # Upstream's English list is shared with generate()'s >30 s chunker, so it stays untouched; Spanish is added here.

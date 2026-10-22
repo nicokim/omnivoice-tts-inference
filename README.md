@@ -35,20 +35,22 @@ audio = model.generate("Hello, this is a test of OmniVoice.", "en")[0]
 `generate()` returns a list with one 1-D float32 array at `model.sampling_rate` (24 kHz). Save it with, for example,
 soundfile (not a dependency): `soundfile.write("out.wav", audio, model.sampling_rate)`.
 
-- **One warm-up call at startup.** The first `generate()` of a process takes 0.55-0.56 s on sdpa and 0.65-0.89 s on
-  FlashInfer (RTX 5090, measured on upstream code). One call at startup removes that cost from the first request.
+- **One warm-up call at startup.** The first `generate()` of a process takes 0.57-0.61 s on sdpa and 0.62-0.66 s on
+  FlashInfer (RTX 5090, measured on the library). One call at startup removes that cost from the first request.
 - **Never call `.half()` or `.to(dtype)` after loading:** they also cast RoPE's fp32 `inv_freq` buffers and the
-  codec. Pass `dtype=` instead. Moving with `.to("cuda:0")` is fine.
+  codec. Pass `dtype=` instead. Moving with `.to("cuda:0")` is fine. Models loaded here are for inference:
+  `save_pretrained()` output carries the decode-only codec's keys and does not load back with `from_pretrained()`.
 - `device_map` is one device (`"cuda:0"`, `0` or a `torch.device`). `None` means CPU; `"auto"`, the other
   multi-device maps and dicts raise `ValueError`. `dtype=None` keeps the config's dtype, which is float32 for
   k2-fsa/OmniVoice, so pass `dtype=torch.float16`.
 - The path is a local directory, used as is, or a Hub repo id. Besides `device_map` and `dtype`, `from_pretrained()`
-  takes only `revision`, `token`, `cache_dir` and `local_files_only`. They also reach the codec download that a
-  checkpoint without `audio_tokenizer/` falls back to (`eustlb/higgs-audio-v2-tokenizer`, at a pinned revision). Any
-  other keyword raises `TypeError`. The checkpoint must be a single `model.safetensors`.
+  takes only `revision`, `token`, `cache_dir` and `local_files_only`. A checkpoint without `audio_tokenizer/` falls back
+  to a codec download (`eustlb/higgs-audio-v2-tokenizer`, at a pinned revision), which gets `token`, `cache_dir` and
+  `local_files_only` but not `revision`. Any other keyword raises `TypeError`. The checkpoint must be a single
+  `model.safetensors`.
 - `language` is an ID (`"es"`, `"ES"`) or a name (`"Spanish"`) from `model.supported_language_ids()` or
   `model.supported_language_names()`, matched case-insensitively, or `None` for none. An unknown one raises
-  `ValueError`. Upstream notes that naming the language works slightly better.
+  `ValueError`. Upstream notes that passing a language works slightly better than `None`.
 - Text with nothing to speak (no letter or digit, such as `""` or `"..."`) raises `ValueError`. `"[laughter]"` alone
   is speech.
 
@@ -149,9 +151,10 @@ pip install 'omnivoice-tts-inference[tn]'
 
 **Calls**
 
-- `language` is required; without it `normalize()` raises `TypeError`. It takes `generate()`'s values: `"es"`, `"ES"`,
-  `" es "`, `"Spanish"` and `"spanish"` are normalized. `None`, `"en"`, `"spa"`, `"es-AR"`, `"es_419"`, any other
-  string and whitespace-only text come back unchanged, without importing NeMo.
+- `language` is required; without it `normalize()` raises `TypeError`. It takes `generate()`'s values, plus
+  whitespace-padded ones: `"es"`, `"ES"`, `" es "`, `"Spanish"` and `"spanish"` are normalized. `None`, `"en"`,
+  `"spa"`, `"es-AR"`, `"es_419"`, any other string and whitespace-only text come back unchanged, without importing
+  NeMo.
 - While nemo-text-processing is missing, every Spanish call raises `ImportError` with the install command. An explicit
   `cache_dir` that cannot be created or written raises `OSError`, before the grammar build. Any other error from NeMo
   or the rules propagates; upstream swallowed it with a warning and spoke the raw text. No input raised in about
@@ -207,10 +210,11 @@ later `TextNormalizer` loads it on its first call in 0.40-0.61 s.
 
 - The file name carries both versions (`es-cased-nemo1.2.0-pynini2.1.6.post1.pkl`, 59.7 MB; 48.4 MB with pynini
   2.1.7), so an upgrade writes a new file. Old files are yours to clean up.
-- Writing. A directory the library creates is 0700; an existing one keeps its permissions. The pickle is written to a
-  temporary file in `cache_dir`, created 0600 whatever the umask and before the build, so an unwritable `cache_dir`
-  fails in 0.2 s instead of after the build. `os.replace` then swaps it in atomically: a process starting meanwhile
-  never reads half a file, and the last writer wins. The temporary file is removed on any failure.
+- Writing. The cache directory itself (the last directory the library creates) is 0700; an existing one keeps its
+  permissions. The pickle is written to a temporary file in `cache_dir`, created 0600 whatever the umask and before the
+  build, so an unwritable `cache_dir` fails in 0.2 s instead of after the build. `os.replace` then swaps it in
+  atomically: a process starting meanwhile never reads half a file, and the last writer wins. The temporary file is
+  removed on any failure.
 - Loading. Unpickling runs code, so the pickle is loaded only when it opens as a regular file (with `O_NOFOLLOW`, so a
   symlink is refused), owned by the current user, with no group or other write bit. Anything else is rebuilt and
   replaced. A pickle you own that nobody else can write is trusted: that is the trust boundary. On Windows the cache
@@ -323,9 +327,11 @@ def player():
 
 
 threading.Thread(target=player, daemon=True).start()
-for item in model.generate_streaming(reply, "es"):  # this thread owns the model
-    items.put(item)
-items.put(None)
+try:
+    for item in model.generate_streaming(reply, "es"):  # this thread owns the model
+        items.put(item)
+finally:
+    items.put(None)  # also after an error, so the player ends
 ```
 
 With asyncio, run every model call, every `next()` and the `close()` on one worker thread. `normalize` then also runs
@@ -352,14 +358,16 @@ async def speak(reply):
 `close()` from another thread during `next()` raises `ValueError('generator already executing')`, which is why the
 `close()` goes to the worker too. Under `task.cancel()`, the worker finishes the sentence in flight and then closes.
 
-**What it buys.** These figures come from KohAI replies (RTX 5090, fp16, 32 steps), measured on upstream code and on
-an emulation of the library, to re-measure on the library itself.
+**What it buys.** These figures come from KohAI replies (RTX 5090, fp16, 32 steps). The TTS time, the first audio and
+the FlashInfer comparison were measured on the library, on 20 replies of 2-4 sentences, before text normalization. The
+typical reply's gain comes from a model of upstream code's timings over 10,135 replies, and the figures next to the LLM
+from an emulation of the library.
 
 - With the whole reply in hand at sdpa, the first audio of a typical KohAI reply comes only ≈ 4 ms (≈ 14 ms with text
   normalization) before `generate()`'s, at ≈ 2× the TTS time.
 - Items still give subtitles, a cancel point at each sentence and overlap with the LLM when the caller feeds
   sentences.
-- When latency matters, use FlashInfer: first audio in ≈ 0.10 s, and a whole reply of up to ≈ 10 s arrives before
+- When latency matters, use FlashInfer: first audio in ≈ 0.11 s, and a whole reply of up to ≈ 12 s arrives before
   sdpa's first sentence.
 - When the caller feeds sentences from a streaming LLM as they finish, as kohai-v3 does, the first audio comes at the
   LLM's first sentence plus one call: 0.43 s (FlashInfer) and 0.58 s (sdpa), median, measured next to the LLM.
@@ -466,7 +474,8 @@ On GPUs with compute capability 12.x, such as the RTX 50 series, start Python wi
 environment. When FlashInfer finds no arch it can build or load for the GPU, `apply_flashinfer` raises a
 `RuntimeError` that names the variable, before it patches anything. The library never sets environment variables.
 Both routes were measured on the library on an RTX 5090: they patch the model, give bit-identical audio on 12 KohAI
-lines and run within 3 % of each other. The table below is cu128 with `12.0a`.
+lines and run within 5 % of each other (FlashInfer fp16 was 5 % slower on cu129, FlashInfer + int8 the same). The
+table below is cu128 with `12.0a`.
 
 **Measured on the library**, on an RTX 5090 with fp16 weights, 32 steps and batch 1 (torch 2.8 with CUDA 12.8 and
 PyTorch's default CUDA allocator). "Resident" is the allocated memory after loading and the warm-up call, and
@@ -474,14 +483,19 @@ includes the FlashInfer runner. "Peak" is the allocated peak of a call on a text
 text. "nvidia-smi" is the process after the short texts, "RTF" is over 12 short KohAI lines (the range over fresh
 processes), and the last column is the median time to the first stream item over 20 KohAI replies of 2-4 sentences,
 before text normalization, which adds about 10 ms. Timings move with the machine's other load: in a quieter session
-the same work ran 2-10 % faster (RTF 0.053, 0.057, 0.023-0.024 and 0.031).
+the same work ran 1-10 % faster (RTF 0.053, 0.057, 0.023-0.024 and 0.031).
 
 | | resident GiB | peak GiB, ≤ 6 s / 20 s text | nvidia-smi MiB | RTF | first sentence of a typical reply |
 |---|---|---|---|---|---|
-| sdpa fp16 | 1.23 | 1.33 / 1.56 | 2,050 | 0.054-0.057 | 261 ms |
-| sdpa int8 | 0.83 | 0.93 / 1.16 | 1,650 | 0.058-0.059 | 283 ms |
+| sdpa fp16 | 1.23 | 1.33 / 1.56 | 2,050 | 0.055-0.057 | 261 ms |
+| sdpa int8 | 0.83 | 0.93 / 1.16 | 1,650 | 0.058 | 283 ms |
 | FlashInfer fp16 | 1.37 | 1.47 / 1.70 | 2,242 | 0.024-0.025 | 111 ms |
 | FlashInfer + int8 | 0.96 | 1.06 / 1.29 | 1,768 | 0.034 | 135 ms |
+
+With the default allocator, a long-running process holds more after long texts: sdpa fp16 holds 2,764 MiB after one
+20 s text and 2,862 MiB through a 1,000-call soak, against 2,050 MiB in the table.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the launch environment, a caller setting (the library sets none),
+keeps it near the short-text figure: 2,254 MiB after the 20 s text.
 
 `scripts/benchmark.py`, in the repository but not the package, measures memory, load time, the cold call, the first
 stream item and a 29 s paragraph's RTF on the library (`--backend sdpa|flashinfer`, `--int8`).
@@ -489,8 +503,8 @@ stream item and a 29 s paragraph's RTF on the library (`--backend sdpa|flashinfe
 When to use which:
 
 - FlashInfer fp16 is the fastest, and the best neighbor for an LLM on the same GPU.
-- int8 trades 0.41 GiB for +5-8 % (sdpa) or +31-40 % (FlashInfer) time per call, and costs a co-located LLM more of
-  its decode. Use it only when GPU memory is the constraint.
+- int8 trades 0.40-0.41 GiB for +4-8 % (sdpa) or +31-41 % (FlashInfer) time per call, and costs a co-located LLM
+  more of its decode. Use it only when GPU memory is the constraint.
 
 Both int8 configs passed a blind listening on KohAI: no difference heard in 19 of 20 pairs, and int8 preferred in the
 other.
@@ -741,6 +755,8 @@ def kohai(text, emotion="neutral"):
 
 - The code is Apache-2.0 ([LICENSE](LICENSE), upstream's, unchanged), as a derivative work of k2-fsa/OmniVoice. Each
   modified upstream file carries a modification notice, and the FlashInfer module keeps NVIDIA's SPDX header.
+- `omnivoice_tts/utils/es_rules.py` is not derived from k2-fsa/OmniVoice: it is the maintainer's own Apache-2.0 code
+  (Copyright 2026 Kimox), copied byte for byte from indextts25-inference.
 - The library ships no weights. k2-fsa's pre-trained OmniVoice weights are licensed CC-BY-NC, because of their
   training data (see the [model card](https://huggingface.co/k2-fsa/OmniVoice)).
 - The audio codec, Higgs Audio v2's tokenizer (a checkpoint's `audio_tokenizer/`, or the

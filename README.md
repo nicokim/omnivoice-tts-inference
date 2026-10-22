@@ -465,8 +465,8 @@ On GPUs with compute capability 12.x, such as the RTX 50 series, start Python wi
 `FLASHINFER_CUDA_ARCH_LIST=12.0a` (the `+cu128` wheel) or `FLASHINFER_CUDA_ARCH_LIST=12.0f` (`+cu129`) in its
 environment. When FlashInfer finds no arch it can build or load for the GPU, `apply_flashinfer` raises a
 `RuntimeError` that names the variable, before it patches anything. The library never sets environment variables.
-The measured stack is cu129 with `12.0f`; the cu128 route with `12.0a` is inferred from FlashInfer's shipped kernels
-and code.
+The measured stack is cu129 with `12.0f`. The cu128 route with `12.0a` was checked on the library as well: on an RTX
+5090 both routes patch the model and give bit-identical audio on 12 KohAI lines.
 
 **Measured on an emulation of the library, to re-measure.** The emulation is upstream's code with this library's
 changes applied (decode-only codec, `use_cache=False`, CPU-first patching), on an RTX 5090 with fp16 weights, 32 steps

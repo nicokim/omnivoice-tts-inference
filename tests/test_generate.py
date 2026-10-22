@@ -213,3 +213,43 @@ def test_text_without_speech_raises():
         assert rec.calls == []
     stub = stub_model(OmniVoice, RuleDurationEstimator(), Recorder())
     assert len(stub.generate("[laughter]")) == 1  # a tag alone is speech
+
+
+def test_gumbel_sample_matches_rand_like():
+    logits = torch.randn(1, 8, 30, 1025)
+    for lg in (logits, logits.permute(0, 2, 1, 3)):
+        torch.manual_seed(3)
+        s = lg / 0.7
+        u = torch.rand_like(s)
+        want = s + -torch.log(-torch.log(u + 1e-10) + 1e-10)  # upstream's formula
+        torch.manual_seed(3)
+        assert torch.equal(ov._gumbel_sample(lg, 0.7), want)
+        assert torch.equal(ov._gumbel_sample(lg, 0.7, torch.Generator().manual_seed(3)), want)
+
+
+def test_generator_reaches_every_chunk():
+    g, rec = torch.Generator().manual_seed(1), Recorder(draw=True)
+    run(UP["chunked"][0]["text"], {"language": "es", "generator": g}, rec)
+    assert len(rec.calls) > 1 and all(x is g for x in rec.gens)
+
+
+def test_private_generator_matches_global_seed():
+    m, seen = tiny_model(), []
+    m._decode_and_post_process = lambda tokens, gen_config: seen.append(tokens) or np.zeros(1, np.float32)
+    kw = dict(num_step=4, class_temperature=1.0)
+    torch.manual_seed(7)
+    m.generate("hola [laughter] hola.", "es", **kw)
+    m.generate("hola [laughter] hola.", "es", generator=torch.Generator().manual_seed(7), **kw)
+    torch.manual_seed(8)
+    m.generate("hola [laughter] hola.", "es", **kw)
+    assert torch.equal(seen[0], seen[1]) and not torch.equal(seen[0], seen[2])  # tokens: tiny audio hides the RNG
+
+
+def test_generator_leaves_global_rng_untouched():
+    m = tiny_model()
+    state = torch.get_rng_state()
+    kw = dict(num_step=4, class_temperature=1.0, postprocess_output=False)  # both gumbel draws are live
+    m.generate("hola [laughter] hola.", "es", generator=torch.Generator().manual_seed(7), **kw)
+    assert torch.equal(torch.get_rng_state(), state)
+    m.generate("hola [laughter] hola.", "es", **kw)  # control: without a generator the global RNG does move
+    assert not torch.equal(torch.get_rng_state(), state)

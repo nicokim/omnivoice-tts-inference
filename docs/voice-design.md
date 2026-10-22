@@ -1,3 +1,4 @@
+<!-- Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4 -->
 # Voice Design
 
 Voice Design mode lets you describe the desired speaker through speaker attributes (`instruct` parameter) — no reference audio needed. The model
@@ -7,7 +8,7 @@ generates a matching voice on the fly.
 
 ```python
 import torch
-from omnivoice import OmniVoice
+from omnivoice_tts import OmniVoice
 
 model = OmniVoice.from_pretrained(
     "k2-fsa/OmniVoice",
@@ -25,8 +26,10 @@ audio = model.generate(
 
 The `instruct` parameter accepts a comma-separated string of speaker attributes.
 Each attribute belongs to a **category** (gender, age, pitch, style, accent,
-or dialect). Within a category, only one attribute may be selected at a time.
-Attributes from different categories can be freely combined.
+or dialect). Pick at most one attribute per category: this is advice, not a
+check, and conflicting attributes are passed on to the model. Attributes from
+different categories can be freely combined. Unknown items pass through too,
+lowercased, and typos get no suggestion: `"femal"` reaches the model as is.
 
 The model auto-detects the language of the instruct text and normalises it
 internally — you can write in English, Chinese, or a mix of both.

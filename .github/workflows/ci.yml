@@ -27,6 +27,8 @@ jobs:
           enable-cache: true
 
       - run: uv run --extra tn --group test pytest --cov=omnivoice_tts
+        env:
+          OMNIVOICE_TN_CACHE: ${{ runner.temp }}/omnivoice-tn
 
   floor:
     runs-on: ubuntu-latest

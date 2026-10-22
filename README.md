@@ -17,7 +17,9 @@ model, such as a fine-tune's emotions or speaking rates, are the caller's config
 pip install omnivoice-tts-inference
 ```
 
-Python 3.10 or newer. FlashInfer is a separate install ([FlashInfer and int8](#flashinfer-and-int8)).
+Python 3.10 or newer. Spanish text normalization needs the `tn` extra
+([Text normalization (Spanish)](#text-normalization-spanish)), and FlashInfer is a separate install
+([FlashInfer and int8](#flashinfer-and-int8)).
 
 ```python
 import torch
@@ -114,7 +116,155 @@ Use brackets only for tags and CMU overrides. Text normalization passes every `[
 pinyin overrides are not protected: in text normalized as Spanish, the tone digit of `ZHE2` is exposed like any other
 digit. Text in any other language passes through normalization unchanged.
 
-<!-- TODO(TN): the "Text normalization (Spanish)" section goes here. -->
+## Text normalization (Spanish)
+
+Digits, money and times are read worse than words ("How well it reads", below), so Spanish text can be turned into
+its spoken form first. It is a step you run, with `TextNormalizer`: normalize before `generate()`, or pass the
+normalizer to `generate_streaming()`. Only Spanish is normalized.
+
+```python
+from omnivoice_tts.utils.text import TextNormalizer
+
+tn = TextNormalizer(cache_dir=None)  # nothing is imported or built yet
+spoken = tn.normalize("Me donaron $1.500.", "es")  # "Me donaron mil quinientos pesos."
+audio = model.generate(spoken, "es")[0]
+
+for audio, sentence in model.generate_streaming(reply, "es", normalize=tn.normalize):
+    ...  # each sentence is normalized before it is spoken; `sentence` stays raw, for subtitles
+```
+
+**Install**
+
+```bash
+pip install 'omnivoice-tts-inference[tn]'
+```
+
+- The `tn` extra installs nemo-text-processing 1.2, whose output the rules are tuned to. It pins pynini 2.1.6.post1,
+  which has PyPI wheels only for Linux x86_64 and CPython up to 3.13, so the extra installs nothing elsewhere.
+- Installing it always compiles cdifflib, which ships no Linux wheels, and on Python 3.13 also editdistance. It needs a
+  C/C++ compiler and the Python headers, and adds about 0.7 GB (pynini takes 650 MiB).
+- Python 3.14: add nemo-text-processing yourself, with a uv `override-dependencies = ["pynini>=2.1.7"]` (a library
+  cannot declare one). This was not run.
+- macOS, Windows and aarch64: install pynini from conda-forge first, then nemo-text-processing (untested).
+
+**Calls**
+
+- `language` is required; without it `normalize()` raises `TypeError`. It takes `generate()`'s values: `"es"`, `"ES"`,
+  `" es "`, `"Spanish"` and `"spanish"` are normalized. `None`, `"en"`, `"spa"`, `"es-AR"`, `"es_419"`, any other
+  string and whitespace-only text come back unchanged, without importing NeMo.
+- While nemo-text-processing is missing, every Spanish call raises `ImportError` with the install command. An explicit
+  `cache_dir` that cannot be created or written raises `OSError`, before the grammar build. Any other error from NeMo
+  or the rules propagates; upstream swallowed it with a warning and spoke the raw text. No input raised in about
+  41,000 measured calls.
+- Normalization can leave nothing to say (`"<3"` becomes `""`). `generate_streaming()` skips such a sentence. Before
+  `generate()`, check the normalized text yourself: `generate()` raises `ValueError` on text with nothing to speak.
+
+**Spanish numbers**
+
+Spanish text goes through NeMo plus a layer of rules for what NeMo reads wrong
+(`omnivoice_tts/utils/es_rules.py`), following Argentine usage. `$` is pesos, the Latin American
+convention, before or after the amount (`$1.250,50` → "mil doscientos cincuenta pesos con
+cincuenta", `1500$` → "mil quinientos pesos"); `US$`, `U$S` and `USD` are dollars, also in
+`USD $500` and `$500 USD`. Numbers agree with their noun ("ciento una personas", "a la una",
+"la primera vez" for `la 1° vez`) and keep their full form as labels ("capítulo uno") and before
+a verb ("en dos mil veintiuno empecé"), unless the label or name is followed by what they count
+("ToxicMati un bit"). Heights read "uno setenta", scores "tres a uno", ranges "diez a quince
+kilómetros", ordinals "1era" → "primera". `H.MM` is a time (`te espero 21.30`, `21.30 hs` →
+"veintiuna y media") unless a unit or a measure follows (`9.58 segundos`, `3.15 %`, `2.50 kms`)
+or a version or a grade precedes (`Python 3.11`, `promedio de 7.50`); then it is a decimal, with
+"coma" before a unit ("tres coma quince por ciento", `7.5 hs` → "siete coma cinco horas") and
+"punto" otherwise. Roman numerals are read only in clear contexts ("siglo veintiuno", "del uno
+al doce") and after a regnal name from a fixed list ("Juan Pablo segundo", "Isabel segunda",
+"Luis catorce"); other capitals such as "CV", "MI", "GTA V", "Juan M" or the initial in "Juan
+D. Perón" stay letters.
+
+**Locale.** The rules follow Argentine and Latin American usage, for all `"es"` text; there is no option.
+
+| Convention | Example |
+|---|---|
+| `$` is pesos; `US$`, `U$S` and `USD` are dollars | `Son U$S 1.500.` → "Son mil quinientos dólares." |
+| `21.30` and `hs` are times | `El stream arranca 21.30 hs.` → "El stream arranca veintiuna y media." |
+| Heights read "uno setenta" | `Mide 1,70 m.` → "Mide uno setenta." |
+| `911` reads "nueve once" | `Llamá al 911.` → "Llamá al nueve once." |
+| `<3` and `:3` are dropped | `Te quiero chat <3` → "Te quiero chat" |
+| Chat spellings (`tod@s`, `100pre`) | `Te quiero x100pre.` → "Te quiero por siempre." |
+| Voseo decides agreement | `Con 21 tenés.` → "Con veintiuno tenés.": `tenés` is a verb, not a plural |
+| "Mar del Plata" is a place | `Hay 1 de Mar del Plata.` → "Hay uno de Mar del Plata." |
+
+`$` as pesos is wrong for Spain and the dollarized varieties (es-ES, EC, SV, PA, PR, es-US). There, write `US$` or
+`USD`, pre-normalize your own text, or skip normalization.
+
+**Tags and pronunciation.** Every `[...]` span passes through byte for byte: the 13 non-verbal tags, CMU overrides
+such as `[B EY1 S]`, and any other bracketed text, digits included (`[2]`, `[4.000]`), as upstream does. Only the text
+between spans is normalized, so a number glued to a tag is still read (`Son las 21:30[laughter]` → "Son las veintiuna
+y media[laughter]"), but numbers do not agree across a tag (`Tengo 21 [laughter] años.` → "Tengo veintiuno
+[laughter] años."). Text in IndexTTS's `<word|pronunciation>` syntax also passes through as written, digits included.
+
+**Grammar cache.** NeMo's Spanish grammar is built on the first Spanish call. That takes about 20 s (24.9 s on Python
+3.12, 16.8 s on 3.13) and peaks at 670 MB of RAM. `cache_dir=None`, the default, means no disk I/O: nothing is
+written, and nothing is loaded from a default location. With a `cache_dir`, the built grammar is pickled there, and a
+later `TextNormalizer` loads it on its first call in 0.40-0.61 s.
+
+- The file name carries both versions (`es-cased-nemo1.2.0-pynini2.1.6.post1.pkl`, 59.7 MB; 48.4 MB with pynini
+  2.1.7), so an upgrade writes a new file. Old files are yours to clean up.
+- Writing. A directory the library creates is 0700; an existing one keeps its permissions. The pickle is written to a
+  temporary file in `cache_dir`, created 0600 whatever the umask and before the build, so an unwritable `cache_dir`
+  fails in 0.2 s instead of after the build. `os.replace` then swaps it in atomically: a process starting meanwhile
+  never reads half a file, and the last writer wins. The temporary file is removed on any failure.
+- Loading. Unpickling runs code, so the pickle is loaded only when it opens as a regular file (with `O_NOFOLLOW`, so a
+  symlink is refused), owned by the current user, with no group or other write bit. Anything else is rebuilt and
+  replaced. A pickle you own that nobody else can write is trusted: that is the trust boundary. On Windows the cache
+  is never trusted, and every start rebuilds.
+- NeMo's own `cache_dir` is not used: its FAR export optimizes the grammar again and reads some decimals differently
+  (`1,80`), and pynini's export calls the root `logging.info`, which installs a root handler.
+
+Prebuild the grammar once, in its own process:
+
+```bash
+python -c "from omnivoice_tts.utils.text import TextNormalizer as T; T('/srv/kohai/tn').normalize('1', 'es')"
+```
+
+On Python 3.12 with pynini 2.1.6.post1, a process that built the grammar itself stays about 4× slower at
+normalization for its whole life: 21.8 against 5.4 ms median per call on 630 test cases, and 48.2 against 11.9 ms on
+real replies (the cause is unknown). So prebuild in a separate process, or restart after the first build. On Python
+3.13 with pynini 2.1.7, a call takes 3.1 ms even in the process that built the grammar. With a loaded grammar, the
+first sentence of a reply takes 7.6 ms median, and a whole 2-sentence reply 17.2 ms.
+
+**Threads**
+
+- One call at a time per instance, because NeMo's parser keeps state: one instance shared by 4 threads raised a
+  `ValueError` once in 1,200 calls. Use one `TextNormalizer` per TTS thread.
+- pynini never releases the GIL, for up to about 30 ms per sentence. Call it from the TTS or worker thread, never from
+  an event loop; `generate_streaming(normalize=tn.normalize)` runs it on the thread that steps the stream.
+- Two instances may normalize in two threads at once. Their outputs stay correct, but they can leave NeMo's logger at
+  INFO instead of the level your application set. This is the one exception to the library leaving process-global
+  state as it found it. A module-level lock would fix it, but the lock would be module-level state.
+
+**Logging and failures.** For the length of each build or call, NeMo's log records go to the library's logger,
+`omnivoice_tts.utils.text`, at DEBUG, and NeMo's level is put back afterwards, so nothing is printed. NeMo's own
+warnings, for a text it failed on or one above 500 words, go there too. A text NeMo fails on comes back raw (a
+sentence containing `localhost:5000` is returned unchanged), so a caller that must never speak digits checks for
+digits outside the brackets. The first Spanish call imports NeMo, which has process-wide effects of its own
+([Threads and global state](#threads-and-global-state)).
+
+**Compute any duration on the normalized text.** The duration rule weighs raw text at a median 0.931 of its
+hand-reviewed spoken form, and normalized text at 1.000. With the rule on the raw text, KohAI speaks 6.5 % faster
+(20 % on a third of number sentences), and the most skewed sentence becomes unintelligible. That is why there is no
+`normalize_text=` flag: `generate_streaming(normalize=...)` hands `duration` the spoken text, and with `generate()` you
+normalize first and compute the duration on the result.
+
+**How well it reads.** 485 held-out number sentences were rendered with the KohAI voice, with KohAI's duration rule on
+the normalized text, and transcribed. Normalized text scored a CER of 0.029, with 82 % of the sentences at a CER of
+5 % or less, and 0.99 of the reference duration. Hand-written words scored 0.013 and 93 %, and raw digits 0.065 and
+53 %. Against its own normalized text the CER is 0.008, so the remaining gap is in the text. That passed the bar set
+before scoring, narrowly. The known gaps are symbols such as `>`, `¥` and `√`, `N+`, `00:00`, m:ss timestamps, units
+such as mAh and kcal, abbreviations such as lvl and s. XVIII, Roman numerals, and codes read as cardinals. Rephrase
+or pre-normalize such text; `localhost:5000` and `10²` keep their digits.
+
+**Where the rules come from.** `omnivoice_tts/utils/es_rules.py` is a byte-identical copy of the Spanish rules of
+[indextts25-inference](https://github.com/nicokim/indextts25-inference), whose 647-case suite runs here too. Fixes
+land there first, with their test case, and are then copied; a test pins the copy's sha256. On 34,090 KohAI chat
+sentences and on that suite's 630 normalization cases, the output equals indextts25-inference's.
 
 ## Streaming
 
@@ -442,38 +592,44 @@ Residual effects of dependencies:
 10. **Speed in chunked text.** On text above 30 s with `duration` or `speed`, upstream applied the speed twice to every
     chunk after the first. Chunk 0's length already carries it, so the later chunks use 1.0. The output is unchanged
     when `duration` and `speed` are both `None`.
+11. **Spanish text normalization.** Spanish goes through NeMo plus the rules in `es_rules`, and every other language
+    passes through unchanged. Upstream's was unusable for Argentine Spanish: with num2words it gave
+    `"$tres.quinientos"` and `"ciento uno personas"`, without num2words it did nothing, and `language=None` went to
+    English.
+12. **Normalization failures.** An error raised while normalizing propagates. Upstream caught it, spoke the raw text,
+    and its warning reached stderr through `logging.lastResort`.
 
 **Removed and changed**
 
-11. **Removed:** `VoiceClonePrompt`, `create_voice_clone_prompt`, `load_asr_model`, `transcribe`, the
+13. **Removed:** `VoiceClonePrompt`, `create_voice_clone_prompt`, `load_asr_model`, `transcribe`, the
     `ref_text`/`ref_audio`/`voice_clone_prompt` parameters, the `train`/`load_asr`/`asr_*` keywords,
     `set_input_embeddings`, the loss, the flex/FA2 flags and `feature_extractor`. Also removed: the `normalize_text`
     parameter and the module function `normalize_text()`. Text normalization is a step the caller runs:
     `TextNormalizer.normalize()` before `generate()`, or `generate_streaming(normalize=tn.normalize)`.
-12. **`OmniVoiceGenerationConfig`** keeps upstream's fields and defaults, without `preprocess_prompt` and
+14. **`OmniVoiceGenerationConfig`** keeps upstream's fields and defaults, without `preprocess_prompt` and
     `from_dict`.
-13. **Not packaged:** the CLI (`omnivoice-demo`, `omnivoice-infer`, `omnivoice-infer-batch`), training, data and
+15. **Not packaged:** the CLI (`omnivoice-demo`, `omnivoice-infer`, `omnivoice-infer-batch`), training, data and
     evaluation code, and the LoRA utilities. Dropped dependencies: accelerate, gradio, tensorboardX, webdataset,
     soundfile, librosa, peft, WeTextProcessing and num2words.
-14. **`text` is `str` only;** a list raises `TypeError`.
-15. **Everything after `language` is keyword-only.** Upstream's third positional argument was `ref_text`, so a stale
+16. **`text` is `str` only;** a list raises `TypeError`.
+17. **Everything after `language` is keyword-only.** Upstream's third positional argument was `ref_text`, so a stale
     call raises instead of binding to `instruct`.
-16. **`generator: torch.Generator | None`.** A generator on the model's device drives every draw, chunk by chunk, in
+18. **`generator: torch.Generator | None`.** A generator on the model's device drives every draw, chunk by chunk, in
     order. `None` keeps upstream's global RNG with the same op.
-17. **`instruct`** is normalized like upstream (split, lowercase, EN↔ZH) and never rejected. Upstream raised on
+19. **`instruct`** is normalized like upstream (split, lowercase, EN↔ZH) and never rejected. Upstream raised on
     unknown items (with a suggestion), on a dialect mixed with an accent and on two items of one category, and custom
     items needed a change to its `_INSTRUCT_ALL_VALID` set.
-18. **`generate_streaming()`** is new. Its `duration` is a callable `(spoken text) -> seconds`, and its `normalize` is
+20. **`generate_streaming()`** is new. Its `duration` is a callable `(spoken text) -> seconds`, and its `normalize` is
     a callable `(sentence, language id) -> spoken text` ([Streaming](#streaming)).
-19. **`from_pretrained()`** is the library's own loader: keyword-only arguments, one device, the codec decode-only,
+21. **`from_pretrained()`** is the library's own loader: keyword-only arguments, one device, the codec decode-only,
     and the process's default dtype left alone.
-20. **`OmniVoiceConfig`** drops `audio_codebook_weights` (training only; the config.json key still loads as an
+22. **`OmniVoiceConfig`** drops `audio_codebook_weights` (training only; the config.json key still loads as an
     attribute) and keeps `model_type = "omnivoice"`. There is no Auto registration.
-21. **FlashInfer** is vendored without CUDA graphs or global state. `apply_flashinfer(model)` takes no keywords
+23. **FlashInfer** is vendored without CUDA graphs or global state. `apply_flashinfer(model)` takes no keywords
     (upstream's `enable_cuda_graph` is gone) and keeps its state on the model. Once it fuses the q/k/v and gate/up
     weights, it deletes the originals, which upstream kept (560 MiB).
-22. **`apply_int8()`** is new ([FlashInfer and int8](#flashinfer-and-int8)).
-23. **No process-global changes.** Gone from upstream:
+24. **`apply_int8()`** is new ([FlashInfer and int8](#flashinfer-and-int8)).
+25. **No process-global changes.** Gone from upstream:
     - the 3 warnings filters and `logging.disable` during load;
     - the AutoConfig/AutoModel registration and the flex `AttentionInterface.register`;
     - FlashInfer's module `_CTX`, import-time registration, `set_attn_implementation`, `llm.config.use_cache`
@@ -484,8 +640,12 @@ Residual effects of dependencies:
     - upstream TN's module-level `_ZH_NORMALIZER`/`_EN_NORMALIZER`, and its `logger.warning`, which reached stderr
       through `logging.lastResort`;
     - the class-level `@lru_cache` on `RuleDurationEstimator._get_char_weight`.
-
-<!-- TODO(TN): the text-normalization differences go here. -->
+26. **`normalize_text=` and `omnivoice.utils.text.normalize_text()`** become `TextNormalizer(cache_dir).normalize(text,
+    language)`, called before `generate()` ([Text normalization (Spanish)](#text-normalization-spanish)). `language`
+    is required, and `None` no longer guesses zh or en.
+27. **Text normalization covers Spanish only,** with NeMo plus `es_rules`; the zh/en WeTextProcessing path and
+    num2words are gone.
+28. **Text normalization errors propagate** (fix 12).
 
 **Bit-identity.** With defaults (sdpa, `from_pretrained(dtype=torch.float16)` with fp32 `inv_freq`, an fp32 codec,
 the default config and the global RNG), `generate(text)[0]` is bit-identical (int16 PCM sha256) to upstream's
@@ -518,7 +678,62 @@ sentence that is not skipped, with the RNG left by the items before it. Differen
 
 Kept on purpose for bit-identity: the int16 pydub round trip and the always-on 0.5 peak normalization.
 
-<!-- TODO(TN): the KohAI example goes here. -->
+## KohAI example
+
+The KohAI voice (`kohai-channel/kohai-omni-tts`) is a Spanish fine-tune. Its emotions, speaking rates and tag
+handling below are the caller's config, not the library's: the library never checks them. First prebuild the
+grammar once, in its own process:
+
+```bash
+python -c "import os; from omnivoice_tts.utils.text import TextNormalizer as T; T(os.path.expanduser('~/.cache/kohai/omnivoice-tn')).normalize('1', 'es')"
+```
+
+```python
+import os
+import re
+
+import torch
+
+from omnivoice_tts import OmniVoice
+from omnivoice_tts.utils.text import TextNormalizer
+
+model = OmniVoice.from_pretrained("kohai-channel/kohai-omni-tts", device_map="cuda:0", dtype=torch.float16)
+# sdpa keeps this short. Next to an LLM on the same GPU, use FlashInfer fp16 (the recipe above), as kohai-v3 does.
+tn = TextNormalizer(cache_dir=os.path.expanduser("~/.cache/kohai/omnivoice-tn"))  # one per TTS thread
+# Load the prebuilt grammar now, not in a reply. A process that builds it itself stays ~4x slower at TN
+# (py3.12, pynini 2.1.6.post1).
+tn.normalize("Son las 21:30.", "es")
+
+# KohAI's config, not the library's: duration-rule weight per second of KohAI speech, per emotion,
+# fitted on spoken-form (normalized) labels, so it applies to normalized text only.
+RATES = {"happy": 14.11, "neutral": 13.14, "angry": 15.09, "sad": 12.92, "afraid": 14.73,
+         "surprised": 12.34, "confused": 12.89, "shy": 12.84, "melancholic": 15.4}
+TAGS = re.compile(r"\[[a-z-]+\]")
+weight = model.duration_estimator.calculate_total_weight
+
+
+def kohai_duration(spoken, emotion):
+    return max(1.0, weight(spoken) / RATES[emotion] + 1.2 * spoken.count("[laughter]"))
+
+
+def kohai_stream(reply, emotion="neutral", generator=None):
+    """(audio, subtitle) for each sentence of one LLM reply (its <emotion> tag already removed)."""
+    for audio, sentence in model.generate_streaming(
+            reply, "es", instruct=None if emotion == "neutral" else emotion,
+            normalize=tn.normalize,                                # "21:30" -> "veintiuna y media"
+            duration=lambda spoken: kohai_duration(spoken, emotion),
+            generator=generator):
+        yield audio, " ".join(TAGS.sub("", sentence).split())     # what the LLM wrote, without tags
+
+
+def kohai(text, emotion="neutral"):
+    """One take for a whole text, or None when normalization leaves nothing to say ("<3")."""
+    spoken = tn.normalize(text, "es")
+    if not any(c.isalnum() for c in spoken):
+        return None
+    return model.generate(spoken, "es", instruct=None if emotion == "neutral" else emotion,
+                          duration=kohai_duration(spoken, emotion))[0]
+```
 
 ## Licenses
 

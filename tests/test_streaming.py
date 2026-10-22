@@ -206,3 +206,13 @@ def test_long_sentence_is_one_chunked_item():
     assert next(s)[1] == "¿Y ahora?" and len(rec.calls) == 6
     with pytest.raises(StopIteration):
         next(s)
+
+
+def test_normalize_keeps_raw_subtitles(tn, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    m, rec = stub()
+    items = list(m.generate_streaming("Son las 21:30. Me donaron $1.500.", "es", normalize=tn.normalize))
+    assert [s for _, s in items] == ["Son las 21:30.", "Me donaron $1.500."]
+    assert len(rec.calls) == 2 and not any(c.isdigit() for call in rec.calls for c in call[1][0])  # words reached it
+    assert list(tmp_path.iterdir()) == []  # nothing written to HOME or XDG_CACHE_HOME

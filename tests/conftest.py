@@ -1,4 +1,7 @@
-"""Tiny random models for the CPU tests: a Qwen3 LLM, a word-level tokenizer and a Higgs codec."""
+"""Tiny random models for the CPU tests: a Qwen3 LLM, a word-level tokenizer and a Higgs codec; one session
+TextNormalizer."""
+
+import os
 
 import pytest
 import torch
@@ -7,6 +10,7 @@ from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel
 
 from omnivoice_tts.models.omnivoice import OmniVoice, OmniVoiceConfig
 from omnivoice_tts.utils.duration import RuleDurationEstimator
+from omnivoice_tts.utils.text import TextNormalizer
 
 TINY_LLM = dict(model_type="qwen3", hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
                 num_key_value_heads=2, head_dim=16, vocab_size=1100, max_position_embeddings=512, rope_theta=1e6,
@@ -58,6 +62,19 @@ def tiny_dir(tmp_path_factory):
     tiny_tokenizer().save_pretrained(d)
     tiny_codec().save_pretrained(d / "audio_tokenizer")
     return d
+
+
+@pytest.fixture(scope="session")
+def tn_cache(tmp_path_factory):
+    """Where the session's grammar is pickled: $OMNIVOICE_TN_CACHE, or a session temp dir."""
+    return os.environ.get("OMNIVOICE_TN_CACHE") or str(tmp_path_factory.mktemp("tn-cache"))
+
+
+@pytest.fixture(scope="session")
+def tn(tn_cache):
+    """One TextNormalizer for the session, so NeMo's ~20 s grammar build runs once. Skips without NeMo."""
+    pytest.importorskip("nemo_text_processing")
+    return TextNormalizer(cache_dir=tn_cache)
 
 
 def cfg_batch():

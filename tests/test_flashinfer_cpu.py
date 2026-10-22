@@ -127,17 +127,26 @@ def test_patched_model_moves_whole(fake_cuda, int8):
     assert sum(t.dtype == torch.int8 for t in tensors) == (8 if int8 else 0) and all(t.is_meta for t in tensors)
 
 
+def class_attrs(classes):
+    """What a class-level patch would replace for every model in the process, unseen by an instance's vars():
+    OmniVoice's own _generate_iterative and each module class's own forward."""
+    return vars(OmniVoice)["_generate_iterative"], {c: vars(c).get("forward") for c in classes}
+
+
 @needs_flashinfer
 def test_two_models_share_no_state(fake_cuda):
     a, b = tiny_model(torch.float16), tiny_model(torch.float16)
-    b_modules = list(b.named_modules())
+    b_modules, classes = list(b.named_modules()), {type(m) for m in b.modules()}  # a's classes too
+    before = class_attrs(classes)
     fake_cuda.apply_flashinfer(a)
+    assert class_attrs(classes) == before
     assert not hasattr(b, "_fi_runner") and "_generate_iterative" not in vars(b)
     assert b._generate_iterative.__func__ is OmniVoice._generate_iterative
     assert list(b.named_modules()) == b_modules and not any("forward" in vars(m) for m in b.modules())
     assert not hasattr(fake_cuda, "_CTX") and plain_tensors(fake_cuda) == []
 
     fake_cuda.apply_flashinfer(b)
+    assert class_attrs(classes) == before
     assert b._fi_runner is not a._fi_runner
     assert all(layer.self_attn._fi_runner is m._fi_runner for m in (a, b) for layer in m.llm.layers)
     assert a._generate_iterative.__self__ is a and b._generate_iterative.__self__ is b

@@ -1,40 +1,43 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Modified by omnivoice-tts-inference from k2-fsa/OmniVoice 08be0b4
+# (omnivoice/models/omnivoice_flashinfer.py): per-model state instead of the
+# module-level _CTX and the global "omnivoice_fi" attention registration, fused
+# q/k/v and gate/up weights replace the originals, plan dtype follows the model,
+# CUDA graphs removed, private generator for the Gumbel noise.
 """FlashInfer-accelerated iterative decoding for OmniVoice.
-
-Approach (mirrors CosyVoice/runtime/triton_trtllm/token2wav_dit_flashinfer.py):
 
 - Sequence packing: the baseline pads the uncond (CFG) sequence to the cond
   length and runs batch=2 with a (2,1,S,S) bool mask. Here cond+uncond are
   packed into ONE row of length c_len+u_len with per-document positions and
-  flashinfer ragged attention (qo_indptr = document boundaries) — no pad
+  flashinfer ragged attention (qo_indptr = document boundaries) - no pad
   compute, no S^2 mask materialization.
-- Attention: registered as a custom HF attention implementation
-  ("omnivoice_fi") via AttentionInterface; reads the wrapper planned
-  once per generation from a module-level context. HF mask construction is
-  bypassed by passing attention_mask={"full_attention": None}.
-- KV cache: disabled (llm.config.use_cache=False). Iterative bidirectional
-  decoding recomputes the full sequence every step, so the DynamicCache the
-  baseline builds each forward is pure overhead.
-- Optional CUDA graphs: one graph per packed shape; all 32 denoising steps
-  replay the same graph (input_ids/audio_mask/position_ids are copied into
-  static buffers). Each shape owns a private flashinfer wrapper, since a
-  plan bakes its launch metadata into the captured graph.
+- Kernels: flashinfer RMSNorm, in-place RoPE in NHD layout, one GEMM for q/k/v
+  and one for gate/up followed by silu_and_mul; audio heads run on the target
+  positions only. No KV cache.
 
 Usage:
-    from omnivoice_flashinfer import apply_flashinfer
-    apply_flashinfer(model, enable_cuda_graph=True)
+    from omnivoice_tts.models.omnivoice_flashinfer import apply_flashinfer
+    apply_flashinfer(model)
+
+Needs flashinfer-python 0.6.15.post1 and the matching flashinfer-jit-cache
+wheel; see the README for the install command and FLASHINFER_CUDA_ARCH_LIST.
 """
 
 import math
-import time
 from types import MethodType
 
-import flashinfer
 import torch
-import torch.nn.functional as F
-from transformers.modeling_utils import AttentionInterface
+from torch import nn
+
+try:
+    import flashinfer
+except ImportError as e:
+    raise ImportError(
+        "apply_flashinfer needs FlashInfer: pip install flashinfer-python==0.6.15.post1 "
+        '"flashinfer-jit-cache==0.6.15.post1+cu128" --extra-index-url '
+        "https://flashinfer.ai/whl/cu128/ (cu129 for a CUDA 12.9 torch)"
+    ) from e
 
 from omnivoice_tts.models.omnivoice import (
     GenerationTask,
@@ -44,25 +47,6 @@ from omnivoice_tts.models.omnivoice import (
 )
 
 _WORKSPACE_SIZE = 128 * 1024 * 1024
-# Context read by the registered attention function. "wrapper" must be planned
-# for the current packed layout before any llm forward.
-_CTX = {"wrapper": None}
-
-
-def _flashinfer_attention(
-    module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs
-):
-    """query (1, Hq, S, D), key/value (1, Hkv, S, D) — packed documents."""
-    _b, hq, s, d = query.shape
-    hkv = key.shape[1]
-    q = query.transpose(1, 2).reshape(s, hq, d)
-    k = key.transpose(1, 2).reshape(s, hkv, d)
-    v = value.transpose(1, 2).reshape(s, hkv, d)
-    out = _CTX["wrapper"].run(q, k, v)  # (S, Hq, D)
-    return out.view(1, s, hq, d), None
-
-
-AttentionInterface.register("omnivoice_fi", _flashinfer_attention)
 
 
 def _fi_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -81,12 +65,18 @@ def _fi_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 def _patch_rmsnorm(llm):
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
-    n = 0
     for module in llm.modules():
         if isinstance(module, Qwen3RMSNorm):
             module.forward = MethodType(_fi_rmsnorm_forward, module)
-            n += 1
-    return n
+
+
+def _fused_linear(*linears: nn.Linear) -> nn.Linear:
+    """One bias-free Linear whose weight is the row-concatenation of ``linears``."""
+    # ponytail: bias-free like upstream; every OmniVoice LLM is Qwen3 with attention_bias=False
+    weight = torch.cat([lin.weight for lin in linears])
+    fused = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device="meta")
+    fused.weight = nn.Parameter(weight, requires_grad=False)
+    return fused
 
 
 def _fi_attention_module_forward(
@@ -102,108 +92,79 @@ def _fi_attention_module_forward(
     The stock forward works in (B, H, S, D): the rotate-half RoPE costs a cat
     plus four elementwise passes, and handing (B,H,S,D) to the ragged wrapper
     costs three transpose copies. Keeping everything in (S, H, D) removes all
-    of that; RoPE is one fused in-place kernel driven by packed position ids
-    (read from _CTX, set per generation / baked per graph)."""
+    of that; RoPE is one fused in-place kernel driven by the packed position
+    ids the runner holds for the current generation."""
     s = hidden_states.shape[1]
-    x = hidden_states[0]  # (S, hidden)
-    if getattr(self, "_fi_w_qkv", None) is not None:
-        qkv = F.linear(x, self._fi_w_qkv)
-        q, k, v = qkv.split(self._fi_qkv_split, dim=-1)
-        # split views are strided; reshape materializes contiguous copies
-        # (q/k would be copied inside the fused rmsnorm anyway)
-        q = self.q_norm(q.reshape(s, -1, self.head_dim))
-        k = self.k_norm(k.reshape(s, -1, self.head_dim))
-        v = v.reshape(s, -1, self.head_dim)
-    else:
-        q = self.q_norm(self.q_proj(x).view(s, -1, self.head_dim))
-        k = self.k_norm(self.k_proj(x).view(s, -1, self.head_dim))
-        v = self.v_proj(x).view(s, -1, self.head_dim)
+    q, k, v = self.qkv_proj(hidden_states[0]).split(self._fi_qkv_split, dim=-1)
+    # split views are strided; reshape materializes contiguous copies
+    # (q/k would be copied inside the fused rmsnorm anyway)
+    q = self.q_norm(q.reshape(s, -1, self.head_dim))
+    k = self.k_norm(k.reshape(s, -1, self.head_dim))
+    v = v.reshape(s, -1, self.head_dim)
+    runner = self._fi_runner
     flashinfer.rope.apply_rope_pos_ids_inplace(
-        q, k, _CTX["pos_ids"], rope_theta=self._fi_rope_theta, interleave=False
+        q, k, runner.pos_ids, rope_theta=self._fi_rope_theta, interleave=False
     )
-    slots = _CTX.get("doc_slots")
-    if slots is not None:
-        # bucketed-graph mode: a flashinfer plan bakes document boundaries
-        # into the graph, so attention runs per fixed-length document slot as
-        # SDPA with an O(slot) key-padding mask whose contents are rewritten
-        # per generation. (A dense (S,S) block-diag mask scales quadratically
-        # and the enable_gqa+mask combo drops SDPA to the math backend, so
-        # k/v are pre-expanded to full heads instead.)
-        ng = self.num_key_value_groups
-        k = k.repeat_interleave(ng, dim=1)  # (S, Hq, D)
-        v = v.repeat_interleave(ng, dim=1)
-        out = torch.empty_like(q)
-        for start, slot_len, m in slots:
-            od = F.scaled_dot_product_attention(
-                q[start : start + slot_len].transpose(0, 1).unsqueeze(0),
-                k[start : start + slot_len].transpose(0, 1).unsqueeze(0),
-                v[start : start + slot_len].transpose(0, 1).unsqueeze(0),
-                attn_mask=m,
-            )
-            out[start : start + slot_len] = od.squeeze(0).transpose(0, 1)
-    else:
-        out = _CTX["wrapper"].run(q, k, v)  # (S, Hq, D)
+    out = runner.wrapper.run(q, k, v)  # (S, Hq, D)
     return self.o_proj(out.reshape(s, -1)).unsqueeze(0), None
 
 
-def _patch_attention_forward(llm, fuse_qkv=True):
+def _patch_attention_forward(llm, runner):
     theta = llm.config.rope_parameters["rope_theta"]
     for layer in llm.layers:
         attn = layer.self_attn
         attn._fi_rope_theta = theta
-        if fuse_qkv:
-            attn._fi_w_qkv = torch.cat(
-                [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
-            )
-            attn._fi_qkv_split = [
-                attn.q_proj.weight.shape[0],
-                attn.k_proj.weight.shape[0],
-                attn.v_proj.weight.shape[0],
-            ]
+        attn._fi_runner = runner
+        attn._fi_qkv_split = [
+            attn.q_proj.out_features,
+            attn.k_proj.out_features,
+            attn.v_proj.out_features,
+        ]
+        attn.qkv_proj = _fused_linear(attn.q_proj, attn.k_proj, attn.v_proj)
+        del attn.q_proj, attn.k_proj, attn.v_proj  # free the originals now
         attn.forward = MethodType(_fi_attention_module_forward, attn)
 
 
 def _fi_mlp_forward(self, x):
     """Qwen3MLP with fused gate+up GEMM and flashinfer silu_and_mul
     (2 GEMMs + silu + mul -> 1 GEMM + 1 fused kernel)."""
-    y = F.linear(x[0], self._fi_w_gate_up)  # (S, 2*inter)
-    y = flashinfer.activation.silu_and_mul(y)
+    y = flashinfer.activation.silu_and_mul(self.gate_up_proj(x[0]))  # (S, inter)
     return self.down_proj(y).unsqueeze(0)
 
 
 def _patch_mlp(llm):
     for layer in llm.layers:
         mlp = layer.mlp
-        mlp._fi_w_gate_up = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0)
+        mlp.gate_up_proj = _fused_linear(mlp.gate_proj, mlp.up_proj)
+        del mlp.gate_proj, mlp.up_proj
         mlp.forward = MethodType(_fi_mlp_forward, mlp)
 
 
 class PackedAttnRunner:
-    def __init__(
-        self,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        device,
-        workspace_size=_WORKSPACE_SIZE,
-    ):
+    """Per-model flashinfer state: the ragged-prefill wrapper planned for the
+    current packed layout, and that layout's int32 position ids."""
+
+    def __init__(self, num_qo_heads, num_kv_heads, head_dim, dtype):
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.device = device
-        self._workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
-        self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            self._workspace, "NHD"
-        )
+        self.dtype = dtype
+        self.wrapper = None
         self._planned_key = None
+        self.pos_ids = None
 
-    def plan(self, doc_lens: list[int], dtype: torch.dtype):
-        key = (tuple(doc_lens), dtype)
+    def plan(self, doc_lens: list[int], device):
+        key = tuple(doc_lens)
         if key == self._planned_key:
             return
-        indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=self.device)
+        # ponytail: the runner's buffers are allocated on the first plan, on the model's device at that time;
+        # move the model before the first generate()
+        if self.wrapper is None:  # first use: lets apply_flashinfer run before model.to("cuda")
+            workspace = torch.zeros(_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+            self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=device)
         indptr[1:] = torch.cumsum(
-            torch.tensor(doc_lens, dtype=torch.int32, device=self.device), dim=0
+            torch.tensor(doc_lens, dtype=torch.int32, device=device), dim=0
         )
         self.wrapper.plan(
             indptr,
@@ -213,19 +174,23 @@ class PackedAttnRunner:
             self.head_dim,
             causal=False,
             sm_scale=self.head_dim**-0.5,
-            q_data_type=dtype,
-            kv_data_type=dtype,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
         )
         self._planned_key = key
 
 
 def _generate_iterative_packed(
-    self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    self,
+    task: GenerationTask,
+    gen_config: OmniVoiceGenerationConfig,
+    generator: torch.Generator | None = None,
 ) -> list[torch.Tensor]:
     """Packed-sequence rewrite of OmniVoice._generate_iterative.
 
     Documents are packed as [cond_0, uncond_0, cond_1, uncond_1, ...] into a
-    single batch row; the scoring/unmasking math is identical to the original.
+    single batch row; the scoring/unmasking math is identical to the original,
+    and at batch 1 the Gumbel noise is drawn with the same shapes and order.
     """
     B = task.batch_size
     inputs_list = [
@@ -246,38 +211,10 @@ def _generate_iterative_packed(
     doc_lens = []
     for c, u in zip(c_lens, u_lens):
         doc_lens.extend([c, u])
-
-    use_graph = getattr(self, "_fi_enable_cuda_graph", False)
-    buckets = getattr(self, "_fi_graph_buckets", None)  # durations in seconds
-
-    # Choose the packed layout. Bucketed-graph mode places each item in fixed
-    # slots [C_budget | U_budget] so one graph per (batch, duration bucket)
-    # serves any sample that fits; otherwise pack tightly.
-    bucket_U = None
-    if use_graph and buckets is not None:
-        frame_rate = self.audio_tokenizer.config.frame_rate
-        t_max = max(u_lens)
-        overhead_max = max(c - u for c, u in zip(c_lens, u_lens))
-        bucket_U = next(
-            (int(d * frame_rate) for d in sorted(buckets) if d * frame_rate >= t_max),
-            None,
-        )
-        if bucket_U is None or overhead_max > self._fi_overhead_budget:
-            bucket_U = None
-            use_graph = False  # too long for the buckets: eager fallback
-
-    if bucket_U is not None:
-        U_b = bucket_U
-        C_b = U_b + self._fi_overhead_budget
-        offsets = []
-        for i in range(B):
-            offsets.extend([i * (C_b + U_b), i * (C_b + U_b) + C_b])
-        total_len = B * (C_b + U_b)
-    else:
-        offsets = [0]
-        for n in doc_lens[:-1]:
-            offsets.append(offsets[-1] + n)
-        total_len = sum(doc_lens)
+    offsets = [0]
+    for n in doc_lens[:-1]:
+        offsets.append(offsets[-1] + n)
+    total_len = sum(doc_lens)
 
     C = self.config.num_audio_codebook
     packed_ids = torch.full(
@@ -327,82 +264,34 @@ def _generate_iterative_packed(
     # gather indices of the logits-consuming positions, laid out as
     # [all cond-target blocks | all uncond blocks] so the guidance/scoring
     # math can run over every item in one batched pass. flat_spans[i] gives
-    # the item's (start, len) within each half; in bucket mode items sit at a
-    # fixed stride U_b with junk rows (pointing at position 0) in between.
+    # the item's (start, len) within each half.
     cond_ranges, uncond_ranges = [], []
     flat_spans = []
     for i in range(B):
         c_off, u_off = offsets[2 * i], offsets[2 * i + 1]
         c_len, t_len = c_lens[i], task.target_lens[i]
-        if bucket_U is not None:
-            flat_spans.append((U_b * i, t_len))
-            cond_rows = torch.zeros(U_b, dtype=torch.long, device=self.device)
-            cond_rows[:t_len] = torch.arange(
-                c_off + c_len - t_len, c_off + c_len, device=self.device
-            )
-            uncond_rows = torch.zeros(U_b, dtype=torch.long, device=self.device)
-            uncond_rows[:t_len] = torch.arange(u_off, u_off + t_len, device=self.device)
-            cond_ranges.append(cond_rows)
-            uncond_ranges.append(uncond_rows)
-        else:
-            prev = 0 if i == 0 else flat_spans[-1][0] + flat_spans[-1][1]
-            flat_spans.append((prev, t_len))
-            cond_ranges.append(
-                torch.arange(c_off + c_len - t_len, c_off + c_len, device=self.device)
-            )
-            uncond_ranges.append(torch.arange(u_off, u_off + t_len, device=self.device))
-    T_flat = (U_b * B) if bucket_U is not None else sum(task.target_lens)
+        prev = 0 if i == 0 else flat_spans[-1][0] + flat_spans[-1][1]
+        flat_spans.append((prev, t_len))
+        cond_ranges.append(
+            torch.arange(c_off + c_len - t_len, c_off + c_len, device=self.device)
+        )
+        uncond_ranges.append(torch.arange(u_off, u_off + t_len, device=self.device))
+    T_flat = sum(task.target_lens)
     tgt_index = torch.cat(cond_ranges + uncond_ranges)
 
-    # flat per-position token state aligned with the cond half of the gathered
-    # layout. Junk positions (bucket-mode slot padding) are initialized to -1
-    # so the global "already unmasked" fill gives them -inf scores and topk
-    # never selects them.
-    tokens_flat = torch.full((C, T_flat), -1, dtype=torch.long, device=self.device)
-    for st, t_len in flat_spans:
-        tokens_flat[:, st : st + t_len] = self.config.audio_mask_id
+    # flat per-position token state aligned with the cond half of the gathered layout
+    tokens_flat = torch.full(
+        (C, T_flat), self.config.audio_mask_id, dtype=torch.long, device=self.device
+    )
 
-    if use_graph and bucket_U is not None:
-        graph_entry = _get_or_capture_bucket_graph(self, B, U_b, C_b)
-        # refresh the per-generation static contents (shape-invariant, data-variant)
-        graph_entry["audio_mask"].copy_(packed_audio_mask)
-        graph_entry["position_ids"].copy_(position_ids)
-        graph_entry["pos_ids_i32"].copy_(position_ids[0].to(torch.int32))
-        graph_entry["tgt_index"].copy_(tgt_index)
-        for d_idx, m in enumerate(graph_entry["doc_masks"]):
-            length = c_lens[d_idx // 2] if d_idx % 2 == 0 else u_lens[d_idx // 2]
-            m[..., :length] = True
-            m[..., length:] = False
-    elif use_graph:
-        graph_entry = _get_or_capture_graph(self, tuple(doc_lens), tgt_index)
-        graph_entry["audio_mask"].copy_(packed_audio_mask)
-        graph_entry["position_ids"].copy_(position_ids)
-    else:
-        self._fi_runner.plan(doc_lens, torch.float16)
-        _CTX["wrapper"] = self._fi_runner.wrapper
-        _CTX["pos_ids"] = position_ids[0].to(torch.int32)
-        _CTX["doc_slots"] = None
-
-    # optional llm timing hook (set by the benchmark; graph replays bypass
-    # model.forward, so wrapping forward would miss them)
-    stats = getattr(self, "_fi_llm_stats", None)
+    runner = self._fi_runner
+    runner.plan(doc_lens, self.device)
+    runner.pos_ids = position_ids[0].to(torch.int32)
 
     for step in range(gen_config.num_step):
-        if stats is not None:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-        if use_graph:
-            graph_entry["input_ids"].copy_(packed_ids)
-            graph_entry["graph"].replay()
-            batch_logits = graph_entry["logits"].to(torch.float32)
-        else:
-            batch_logits = _forward_logits(
-                self, packed_ids, packed_audio_mask, position_ids, tgt_index
-            ).to(torch.float32)
-        if stats is not None:
-            torch.cuda.synchronize()
-            stats["seconds"] += time.perf_counter() - t0
-            stats["calls"] += 1
+        batch_logits = _forward_logits(
+            self, packed_ids, packed_audio_mask, position_ids, tgt_index
+        ).to(torch.float32)
 
         # batched scoring over every item at once: the guidance/log_softmax/
         # argmax/gumbel chain (the GPU-heavy part) runs on the whole
@@ -410,12 +299,14 @@ def _generate_iterative_packed(
         c_logits_all = batch_logits[:, :, :T_flat, :]
         u_logits_all = batch_logits[:, :, T_flat:, :]
         pred_all, scores_all = self._predict_tokens_with_scoring(
-            c_logits_all, u_logits_all, gen_config
+            c_logits_all, u_logits_all, gen_config, generator
         )
         scores_all = scores_all - (layer_ids * gen_config.layer_penalty_factor)
         if gen_config.position_temperature > 0.0:
-            scores_all = _gumbel_sample(scores_all, gen_config.position_temperature)
-        # -inf for already-unmasked positions AND bucket-slot junk (-1)
+            scores_all = _gumbel_sample(
+                scores_all, gen_config.position_temperature, generator
+            )
+        # -inf for already-unmasked positions
         scores_all.masked_fill_(
             (tokens_flat != self.config.audio_mask_id).unsqueeze(0), -float("inf")
         )
@@ -447,15 +338,15 @@ def _forward_logits(model, input_ids, audio_mask, position_ids, tgt_index):
     The scoring step consumes logits at the cond-target and uncond ranges
     (2*sum(t_len) of the packed positions); running the 1024->8200 audio_heads
     GEMM and the fp32 upcast on the full packed length is wasted work.
-    Returns logits of shape (1, C, 2*sum(t_len), V) laid out per item as
-    [cond_target_i (t_i), uncond_i (t_i), ...].
+    Returns logits of shape (1, C, 2*sum(t_len), V).
     """
     inputs_embeds = model._prepare_embed_inputs(input_ids, audio_mask)
     hidden = model.llm(
         inputs_embeds=inputs_embeds,
-        attention_mask={"full_attention": None},
-        return_dict=True,
+        attention_mask={"full_attention": None},  # skips HF mask construction
         position_ids=position_ids,
+        use_cache=False,  # bidirectional decoding recomputes everything each step
+        return_dict=True,
     )[0]
     tgt_hidden = hidden[0, tgt_index]  # (2T, hidden)
     logits_flat = model.audio_heads(tgt_hidden)
@@ -465,190 +356,46 @@ def _forward_logits(model, input_ids, audio_mask, position_ids, tgt_index):
     ).permute(0, 2, 1, 3)
 
 
-def _get_or_capture_graph(model, doc_lens_key, tgt_index):
-    cache = model._fi_graph_cache
-    entry = cache.get(doc_lens_key)
-    if entry is not None:
-        return entry
-
-    device = model.device
-    total_len = sum(doc_lens_key)
-    C = model.config.num_audio_codebook
-    llm_cfg = model.config.llm_config
-    runner = PackedAttnRunner(
-        llm_cfg.num_attention_heads,
-        llm_cfg.num_key_value_heads,
-        llm_cfg.head_dim,
-        device,
-        workspace_size=64 * 1024 * 1024,
-    )
-    runner.plan(list(doc_lens_key), torch.float16)
-    _CTX["wrapper"] = runner.wrapper
-
-    # positions are fully determined by doc_lens (the cache key), so both the
-    # long buffer (model-level rotary) and the int32 copy (fused rope) can be
-    # baked with their final values
-    positions = torch.cat([torch.arange(n, device=device) for n in doc_lens_key])
-    static = {
-        "input_ids": torch.full(
-            (1, C, total_len),
-            model.config.audio_mask_id,
-            dtype=torch.long,
-            device=device,
-        ),
-        "audio_mask": torch.zeros((1, total_len), dtype=torch.bool, device=device),
-        "position_ids": positions.unsqueeze(0).contiguous(),
-    }
-    pos_ids_i32 = positions.to(torch.int32)
-    _CTX["pos_ids"] = pos_ids_i32
-    _CTX["doc_slots"] = None
-
-    side_stream = torch.cuda.Stream()
-    side_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side_stream):
-        for _ in range(2):
-            _forward_logits(
-                model,
-                static["input_ids"],
-                static["audio_mask"],
-                static["position_ids"],
-                tgt_index,
-            )
-    torch.cuda.current_stream().wait_stream(side_stream)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        # tgt_index depends only on doc_lens (the cache key), so it is safe
-        # to bake into the graph
-        logits = _forward_logits(
-            model,
-            static["input_ids"],
-            static["audio_mask"],
-            static["position_ids"],
-            tgt_index,
-        )
-
-    # tgt_index is baked into the captured gather by pointer — the entry must
-    # keep it alive or the allocator will reuse its memory for later samples
-    entry = {
-        "graph": graph,
-        "logits": logits,
-        "runner": runner,
-        "tgt_index": tgt_index,
-        "pos_ids_i32": pos_ids_i32,
-        **static,
-    }
-    cache[doc_lens_key] = entry
-    return entry
+_NO_ARCH = (
+    "FlashInfer found no CUDA arch it can build or load for this GPU (compute "
+    "capability {}.{}). flashinfer 0.6.15 only accepts SM 12.x when the CUDA it "
+    "detects (nvcc from CUDA_HOME, PATH or /usr/local/cuda, else torch.version.cuda) "
+    "is >= 12.9. Start Python with FLASHINFER_CUDA_ARCH_LIST=12.0a "
+    "(flashinfer-jit-cache +cu128) or 12.0f (+cu129). omnivoice_tts never sets "
+    "environment variables."
+)
 
 
-def _get_or_capture_bucket_graph(model, B, U_b, C_b):
-    """One graph per (batch, duration-bucket): items sit in fixed
-    [C_budget | U_budget] slots; attention runs as SDPA over a runtime-updated
-    block-diagonal mask, so any sample that fits the slots replays exactly."""
-    key = ("bucket", B, U_b)
-    cache = model._fi_graph_cache
-    entry = cache.get(key)
-    if entry is not None:
-        return entry
+@torch.no_grad()
+def apply_flashinfer(model):
+    """Patch an OmniVoice instance in place to decode with flashinfer kernels.
 
-    device = model.device
-    total_len = B * (C_b + U_b)
-    C = model.config.num_audio_codebook
+    Run it after any weight edit (e.g. a LoRA merge) and before int8
+    quantization. It may run on a CPU-loaded model that is moved with
+    ``model.to("cuda")`` afterwards: the fused weights are then allocated once
+    on the GPU. Afterwards the model only runs through ``generate()`` and
+    ``generate_streaming()``, one call at a time per instance. Returns ``model``.
+    """
+    if hasattr(model, "_fi_runner"):
+        return model
+    llm = model.llm
+    if not torch.cuda.is_available():
+        raise ValueError("apply_flashinfer needs CUDA")
+    if llm.dtype not in (torch.float16, torch.bfloat16):  # the weights' dtype: the config may still say float32
+        raise ValueError(f"apply_flashinfer needs fp16 or bf16 weights, got {llm.dtype}")
+    if not isinstance(llm.layers[0].self_attn.q_proj, nn.Linear):
+        raise TypeError("apply_flashinfer: q_proj is not an nn.Linear; call it before apply_int8")
+    from flashinfer.jit import current_compilation_context
 
-    static = {
-        "input_ids": torch.full(
-            (1, C, total_len),
-            model.config.audio_mask_id,
-            dtype=torch.long,
-            device=device,
-        ),
-        "audio_mask": torch.zeros((1, total_len), dtype=torch.bool, device=device),
-        "position_ids": torch.zeros((1, total_len), dtype=torch.long, device=device),
-        "pos_ids_i32": torch.zeros(total_len, dtype=torch.int32, device=device),
-        "tgt_index": torch.zeros(2 * B * U_b, dtype=torch.long, device=device),
-    }
-    # per-document key-padding masks (contents updated per generation);
-    # init all-True so warmup/capture has no fully-masked softmax rows
-    doc_masks, doc_slots = [], []
-    for i in range(B):
-        for slot_start, slot_len in (
-            (i * (C_b + U_b), C_b),
-            (i * (C_b + U_b) + C_b, U_b),
-        ):
-            m = torch.ones(1, 1, 1, slot_len, dtype=torch.bool, device=device)
-            doc_masks.append(m)
-            doc_slots.append((slot_start, slot_len, m))
+    if not current_compilation_context.TARGET_CUDA_ARCHS:
+        raise RuntimeError(_NO_ARCH.format(*torch.cuda.get_device_capability()))
 
-    _CTX["wrapper"] = None
-    _CTX["pos_ids"] = static["pos_ids_i32"]
-    _CTX["doc_slots"] = doc_slots
-
-    side_stream = torch.cuda.Stream()
-    side_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side_stream):
-        for _ in range(2):
-            _forward_logits(
-                model,
-                static["input_ids"],
-                static["audio_mask"],
-                static["position_ids"],
-                static["tgt_index"],
-            )
-    torch.cuda.current_stream().wait_stream(side_stream)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        logits = _forward_logits(
-            model,
-            static["input_ids"],
-            static["audio_mask"],
-            static["position_ids"],
-            static["tgt_index"],
-        )
-
-    entry = {
-        "graph": graph,
-        "logits": logits,
-        "doc_masks": doc_masks,
-        "doc_slots": doc_slots,
-        **static,
-    }
-    cache[key] = entry
-    return entry
-
-
-def apply_flashinfer(
-    model,
-    enable_cuda_graph: bool = False,
-    fuse_rmsnorm: bool = True,
-    fuse_attention: bool = True,
-    cuda_graph_buckets=None,
-    overhead_budget: int = 512,
-):
-    """Patch an OmniVoice instance to use flashinfer packed attention."""
-    model.llm.set_attn_implementation("omnivoice_fi")
-    if fuse_rmsnorm:
-        _patch_rmsnorm(model.llm)
-    if fuse_attention:
-        _patch_attention_forward(model.llm)
-        _patch_mlp(model.llm)
-    # Bidirectional iterative decoding recomputes everything each step; the
-    # DynamicCache the baseline allocates+fills per forward is pure overhead.
-    model.llm.config.use_cache = False
-
-    llm_cfg = model.config.llm_config
+    cfg = model.config.llm_config
     model._fi_runner = PackedAttnRunner(
-        llm_cfg.num_attention_heads,
-        llm_cfg.num_key_value_heads,
-        llm_cfg.head_dim,
-        model.device,
+        cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, llm.dtype
     )
-    model._fi_graph_cache = {}
-    model._fi_enable_cuda_graph = enable_cuda_graph or cuda_graph_buckets is not None
-    model._fi_graph_buckets = cuda_graph_buckets
-    model._fi_overhead_budget = overhead_budget
+    _patch_rmsnorm(llm)
+    _patch_attention_forward(llm, model._fi_runner)
+    _patch_mlp(llm)
     model._generate_iterative = MethodType(_generate_iterative_packed, model)
     return model

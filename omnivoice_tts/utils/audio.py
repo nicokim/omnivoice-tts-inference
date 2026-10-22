@@ -16,111 +16,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Audio I/O and processing utilities.
+"""Audio post-processing utilities.
 
-Provides functions for loading, resampling, silence removal,
-chunking, cross-fading, and format conversion.
+Provides silence removal, fade-in/out with edge padding, and cross-fading
+of chunks, plus the numpy <-> pydub conversions they need.
 
 All public functions in this module operate on **numpy float32 arrays**
 with shape ``(C, T)`` (channels-first).
 """
 
-import io
-import logging
-
 import numpy as np
-import soundfile as sf
-import torch
-import torchaudio
 from pydub import AudioSegment
-from pydub.silence import detect_leading_silence, detect_nonsilent, split_on_silence
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
-def load_waveform(audio_path: str):
-    """Load audio from a file path, returning (data, sample_rate).
-
-    Tries two backends in order:
-    1. soundfile — covers WAV/FLAC/OGG etc., no ffmpeg needed.
-    2. librosa — covers MP3/M4A etc. via audioread + ffmpeg.
-
-    Returns:
-        (data, sample_rate) where data is a numpy float32 array of
-        shape (C, T).
-    """
-    try:
-        data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-        return data.T, sr  # (T, C) → (C, T)
-    except Exception:
-        # soundfile cannot handle MP3/M4A etc., fall back to librosa.
-        import librosa
-
-        data, sr = librosa.load(audio_path, sr=None, mono=False)
-        if data.ndim == 1:
-            data = data[np.newaxis, :]
-        return data, sr
-
-
-def load_audio(audio_path: str, sampling_rate: int) -> np.ndarray:
-    """Load a waveform from file and resample to the target rate.
-
-    Parameters:
-        audio_path: path of the audio.
-        sampling_rate: target sampling rate.
-
-    Returns:
-        Numpy float32 array of shape (1, T).
-    """
-    data, sr = load_waveform(audio_path)
-
-    if data.shape[0] > 1:
-        data = np.mean(data, axis=0, keepdims=True)
-    if sr != sampling_rate:
-        data = torchaudio.functional.resample(
-            torch.from_numpy(data), orig_freq=sr, new_freq=sampling_rate
-        ).numpy()
-
-    return data
-
-
-def load_audio_bytes(raw: bytes, sampling_rate: int) -> np.ndarray:
-    """Load audio from in-memory bytes and resample.
-
-    Parameters:
-        raw: raw audio file bytes (e.g. from WebDataset).
-        sampling_rate: target sampling rate.
-
-    Returns:
-        Numpy float32 array of shape (1, T).
-    """
-    buf = io.BytesIO(raw)
-
-    try:
-        data, sr = sf.read(buf, dtype="float32", always_2d=True)
-        data = data.T  # (T, C) → (C, T)
-    except Exception:
-        import librosa
-
-        buf.seek(0)
-        data, sr = librosa.load(buf, sr=None, mono=False)
-        if data.ndim == 1:
-            data = data[np.newaxis, :]
-
-    if data.shape[0] > 1:
-        data = np.mean(data, axis=0, keepdims=True)
-    if sr != sampling_rate:
-        data = torchaudio.functional.resample(
-            torch.from_numpy(data), orig_freq=sr, new_freq=sampling_rate
-        ).numpy()
-
-    return data
-
+from pydub.silence import detect_leading_silence, split_on_silence
 
 # ---------------------------------------------------------------------------
 # Audio processing (all numpy in / numpy out)
@@ -248,55 +155,6 @@ def fade_and_pad_audio(
         processed = np.concatenate([silence, processed, silence], axis=-1)
 
     return processed
-
-
-def trim_long_audio(
-    audio: np.ndarray,
-    sampling_rate: int,
-    max_duration: float = 15.0,
-    min_duration: float = 3.0,
-    trim_threshold: float = 20.0,
-) -> np.ndarray:
-    """Trim audio to <= *max_duration* by splitting at the largest silence gap.
-
-    Only trims when the audio exceeds *trim_threshold* seconds.
-
-    Args:
-        audio: numpy array of shape (C, T).
-        sampling_rate: audio sampling rate.
-        max_duration: maximum duration in seconds.
-        min_duration: minimum duration in seconds.
-        trim_threshold: only trim if audio is longer than this (seconds).
-
-    Returns:
-        Trimmed numpy array.
-    """
-    duration = audio.shape[-1] / sampling_rate
-    if duration <= trim_threshold:
-        return audio
-
-    seg = numpy_to_audiosegment(audio, sampling_rate)
-    nonsilent = detect_nonsilent(
-        seg, min_silence_len=100, silence_thresh=-40, seek_step=10
-    )
-    if not nonsilent:
-        return audio
-
-    max_ms = int(max_duration * 1000)
-    min_ms = int(min_duration * 1000)
-
-    best_split = 0
-    for start, end in nonsilent:
-        if start > best_split and start <= max_ms:
-            best_split = start
-        if end > max_ms:
-            break
-
-    if best_split < min_ms:
-        best_split = min(max_ms, len(seg))
-
-    trimmed = seg[:best_split]
-    return audiosegment_to_numpy(trimmed)
 
 
 def cross_fade_chunks(

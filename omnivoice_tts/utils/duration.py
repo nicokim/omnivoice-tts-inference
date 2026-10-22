@@ -25,7 +25,6 @@ using character phonetic weights across 600+ languages. Used by
 
 import bisect
 import unicodedata
-from functools import lru_cache
 
 
 class RuleDurationEstimator:
@@ -162,7 +161,6 @@ class RuleDurationEstimator:
         ]
         self.breakpoints = [r[0] for r in self.ranges]
 
-    @lru_cache(maxsize=4096)
     def _get_char_weight(self, char):
         """Determines the weight of a single character."""
         code = ord(char)
@@ -247,36 +245,3 @@ class RuleDurationEstimator:
             return low_threshold * (estimated_duration / low_threshold) ** alpha
         else:
             return estimated_duration
-
-
-# ==========================================
-# Example Usage
-# ==========================================
-if __name__ == "__main__":
-    estimator = RuleDurationEstimator()
-
-    ref_txt = "Hello, world."
-    ref_dur = 1.5
-
-    test_cases = [
-        ("Hindi (With complex marks)", "नमस्ते दुनिया"),
-        ("Arabic (With vowels)", "مَرْحَبًا بِالْعَالَم"),
-        ("Vietnamese (Lots of diacritics)", "Chào thế giới"),
-        ("Chinese", "你好，世界！"),
-        ("Mixed Emoji", "Hello 🌍! This is fun 🎉"),
-    ]
-
-    print("--- Reference ---")
-    print(f"Reference Text: '{ref_txt}'")
-    print(f"Reference Duration: {ref_dur}s")
-    print("-" * 30)
-
-    for lang, txt in test_cases:
-        est_time = estimator.estimate_duration(txt, ref_txt, ref_dur)
-        weight = estimator.calculate_total_weight(txt)
-
-        print(f"[{lang}]")
-        print(f"Text: {txt}")
-        print(f"Total Weight: {weight:.2f}")
-        print(f"Estimated Duration: {est_time:.2f} s")
-        print("-" * 30)

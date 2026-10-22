@@ -18,17 +18,17 @@
 
 """Voice-design instruct constants for TTS inference.
 
-Defines speaker attribute tags (gender, age, pitch, accent, dialect) and
-translation/validation utilities between English and Chinese. Used by
-``OmniVoice.generate()`` for voice design mode.
+Defines the bilingual speaker attribute tags (gender, age, pitch, whisper)
+and the English <-> Chinese maps that unify an instruct to one language.
+Used by ``OmniVoice.generate()`` for voice design mode.
 """
 
 import re
 
 _ZH_RE = re.compile(r"[\u4e00-\u9fff]")
 
-# Category = set of {english: chinese, ...} items that are mutually exclusive.
-# Accent (EN-only) and dialect (ZH-only) are stored as flat sets below.
+# One {english: chinese} dict per category. Accents (English-only) and dialects
+# (Chinese-only) have no counterpart, so they pass through unmapped.
 _INSTRUCT_CATEGORIES = [
     {"male": "男", "female": "女"},
     {
@@ -46,53 +46,10 @@ _INSTRUCT_CATEGORIES = [
         "very high pitch": "极高音调",
     },
     {"whisper": "耳语"},
-    # Accent (English-only, no Chinese counterpart)
-    {
-        "american accent",
-        "british accent",
-        "australian accent",
-        "chinese accent",
-        "canadian accent",
-        "indian accent",
-        "korean accent",
-        "portuguese accent",
-        "russian accent",
-        "japanese accent",
-    },
-    # Dialect (Chinese-only, no English counterpart)
-    {
-        "河南话",
-        "陕西话",
-        "四川话",
-        "贵州话",
-        "云南话",
-        "桂林话",
-        "济南话",
-        "石家庄话",
-        "甘肃话",
-        "宁夏话",
-        "青岛话",
-        "东北话",
-    },
 ]
 
 _INSTRUCT_EN_TO_ZH = {}
 _INSTRUCT_ZH_TO_EN = {}
-_INSTRUCT_MUTUALLY_EXCLUSIVE = []
 for _cat in _INSTRUCT_CATEGORIES:
-    if isinstance(_cat, dict):
-        _INSTRUCT_EN_TO_ZH.update(_cat)
-        _INSTRUCT_ZH_TO_EN.update({v: k for k, v in _cat.items()})
-        _INSTRUCT_MUTUALLY_EXCLUSIVE.append(set(_cat) | set(_cat.values()))
-    else:
-        _INSTRUCT_MUTUALLY_EXCLUSIVE.append(set(_cat))
-
-_INSTRUCT_ALL_VALID = (
-    set(_INSTRUCT_EN_TO_ZH)
-    | set(_INSTRUCT_ZH_TO_EN)
-    | _INSTRUCT_MUTUALLY_EXCLUSIVE[-2]  # accents
-    | _INSTRUCT_MUTUALLY_EXCLUSIVE[-1]  # dialects
-)
-
-_INSTRUCT_VALID_EN = frozenset(i for i in _INSTRUCT_ALL_VALID if not _ZH_RE.search(i))
-_INSTRUCT_VALID_ZH = frozenset(i for i in _INSTRUCT_ALL_VALID if _ZH_RE.search(i))
+    _INSTRUCT_EN_TO_ZH.update(_cat)
+    _INSTRUCT_ZH_TO_EN.update({v: k for k, v in _cat.items()})

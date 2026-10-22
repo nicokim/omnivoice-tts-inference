@@ -18,10 +18,11 @@
 
 """Language name to ISO 639-3 code mapping.
 
-Auto-generated from ``docs/lang_id_name_map.tsv``. Provides ``LANG_NAME_TO_ID``
-(for resolving language names to codes) and ``LANG_IDS`` (the set of supported
-ISO 639-3 codes). Used by ``OmniVoice.generate()`` to resolve user-provided
-language names.
+Auto-generated from upstream's ``docs/lang_id_name_map.tsv``
+(https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/docs/lang_id_name_map.tsv).
+Provides ``LANG_NAME_TO_ID`` (for resolving language names to codes) and
+``LANG_IDS`` (the set of supported ISO 639-3 codes). Used by
+``OmniVoice.generate()`` to resolve user-provided language names.
 """
 
 # Auto-generated from docs/lang_id_name_map.tsv
@@ -678,22 +679,3 @@ LANG_NAME_TO_ID = {
 
 LANG_NAMES = set(LANG_NAME_TO_ID.keys())
 LANG_IDS = set(LANG_NAME_TO_ID.values())
-
-# Exceptions where .title() doesn't match the canonical casing from the TSV.
-_TITLE_EXCEPTIONS = {
-    "fe'fe'": "Fe'fe'",
-    "dũya": "Dũya",
-    "santiago del estero quichua": "Santiago del Estero Quichua",
-    "santa ana de tusi pasco quechua": "Santa Ana de Tusi Pasco Quechua",
-    "malinaltepec me'phaa": "Malinaltepec Me'phaa",
-    "tlacoapa me'phaa": "Tlacoapa Me'phaa",
-}
-
-
-def lang_display_name(name: str) -> str:
-    """Return a display-friendly version of a lowercase language name.
-
-    Uses .title() for most names, with manual exceptions for cases like
-    apostrophes and small words (de, del) that should stay lowercase.
-    """
-    return _TITLE_EXCEPTIONS.get(name, name.title())

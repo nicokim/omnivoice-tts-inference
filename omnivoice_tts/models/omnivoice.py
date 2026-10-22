@@ -16,39 +16,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Core OmniVoice model implementation.
+"""Core OmniVoice model implementation, trimmed to inference.
 
-Defines the ``OmniVoice`` model class, generation config, and inference pipeline.
-This is the main entry point for both inference and training:
+Defines the ``OmniVoice`` model class, its config, the generation config and
+the inference pipeline: ``OmniVoice.from_pretrained()`` loads the model, then
+``model.generate()`` synthesizes one text, in voice design mode
+(``instruct``) or with an auto voice.
 
-- **Inference**: ``OmniVoice.from_pretrained()`` loads the model, then
-  ``model.generate()`` supports voice cloning, voice design, and auto voice.
-- **Training**: ``model.forward()`` computes the training loss; the model is
-  built and used by ``omnivoice.training.builder`` and ``omnivoice.training.trainer``.
-
+Upstream's training (the loss and packed attention), voice cloning and ASR
+are removed.
 """
 
-import difflib
 import logging
 import math
 import os
 import re
 from dataclasses import dataclass, fields
-from functools import partial
-from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
-
-try:
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    _flex_attention_available = True
-except ImportError:
-    _flex_attention_available = False
 from transformers import (
     AutoFeatureExtractor,
     AutoModel,
@@ -58,121 +46,28 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.modeling_outputs import ModelOutput
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 from omnivoice_tts.utils.audio import (
     cross_fade_chunks,
     fade_and_pad_audio,
-    load_audio,
     remove_silence,
-    trim_long_audio,
 )
 from omnivoice_tts.utils.duration import RuleDurationEstimator
 from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAMES
-from omnivoice_tts.utils.text import (
-    add_punctuation,
-    chunk_text_punctuation,
-)
-from omnivoice_tts.utils.text import (
-    normalize_text as _normalize_text,
-)
+from omnivoice_tts.utils.text import chunk_text_punctuation
 from omnivoice_tts.utils.voice_design import (
-    _INSTRUCT_ALL_VALID,
     _INSTRUCT_EN_TO_ZH,
-    _INSTRUCT_MUTUALLY_EXCLUSIVE,
-    _INSTRUCT_VALID_EN,
-    _INSTRUCT_VALID_ZH,
     _INSTRUCT_ZH_TO_EN,
     _ZH_RE,
 )
 
 logger = logging.getLogger(__name__)
 
-_AUTOCAST_FLEX_ATTENTION = "omnivoice_flex_attention"
-
-
-def _autocast_flex_attention(module, query, key, value, *args, **kwargs):
-    """flex_attention with the same autocast treatment SDPA already gets.
-
-    Mixed-precision training keeps fp32 master weights, so Qwen3's
-    ``q_norm``/``k_norm`` (fp32 weight x bf16 activation) silently promote
-    q/k — and, through the fp32 RoPE constants, v — back to fp32. SDPA is
-    on autocast's cast list and is downcast at the kernel boundary;
-    ``flex_attention`` is not, so with ``attn_implementation:
-    "flex_attention"`` all attention math runs in fp32: the fp32 backward
-    template is ~12x slower at head_dim=128 (61.8ms vs 5.1ms per
-    layer-call, H100, identical mask/shape/layout), and the flex and sdpa
-    paths become numerically inconsistent with each other. Casting here
-    restores the treatment autocast applies to every other matmul; softmax
-    accumulation inside the kernel is fp32 either way.
-    """
-    if torch.is_autocast_enabled(query.device.type) and query.dtype == torch.float32:
-        dtype = torch.get_autocast_dtype(query.device.type)
-        query, key, value = (t.to(dtype) for t in (query, key, value))
-    return ALL_ATTENTION_FUNCTIONS["flex_attention"](
-        module, query, key, value, *args, **kwargs
-    )
-
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
-
-
-_VOICE_CLONE_PROMPT_FORMAT_VERSION = 1
-
-
-@dataclass
-class VoiceClonePrompt:
-    ref_audio_tokens: torch.Tensor  # (C, T)
-    ref_text: str
-    ref_rms: float
-
-    def save(self, path: str) -> None:
-        """Save this prompt to ``path`` for reuse in a later session.
-
-        The file stores a plain dict with the audio tokens moved to CPU, so
-        it can be loaded with ``torch.load(weights_only=True)`` (the default
-        since torch 2.6) and is portable across devices.
-
-        Args:
-            path: Destination file path (e.g. ``"my_voice.pt"``).
-        """
-        torch.save(
-            {
-                "format_version": _VOICE_CLONE_PROMPT_FORMAT_VERSION,
-                "ref_audio_tokens": self.ref_audio_tokens.detach().cpu(),
-                "ref_text": self.ref_text,
-                "ref_rms": float(self.ref_rms),
-            },
-            path,
-        )
-
-    @classmethod
-    def load(cls, path: str, map_location: str = "cpu") -> "VoiceClonePrompt":
-        """Load a prompt saved with :meth:`save`.
-
-        The returned prompt can be passed directly to
-        :meth:`OmniVoice.generate`; the audio tokens are moved to the model
-        device automatically during generation, so no manual ``.to(device)``
-        is needed.
-
-        Args:
-            path: File path previously written by :meth:`save`.
-            map_location: Device to load the audio tokens onto.
-        Returns:
-            The restored :class:`VoiceClonePrompt`.
-        """
-        data = torch.load(path, map_location=map_location, weights_only=True)
-        version = data.get("format_version")
-        if version != _VOICE_CLONE_PROMPT_FORMAT_VERSION:
-            raise ValueError(f"Unsupported VoiceClonePrompt format version: {version}")
-        return cls(
-            ref_audio_tokens=data["ref_audio_tokens"],
-            ref_text=data["ref_text"],
-            ref_rms=data["ref_rms"],
-        )
 
 
 @dataclass
@@ -184,7 +79,6 @@ class OmniVoiceGenerationConfig:
     position_temperature: float = 5.0
     class_temperature: float = 0.0
     denoise: bool = True
-    preprocess_prompt: bool = True
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
@@ -207,34 +101,11 @@ class GenerationTask:
     instructs: list[str | None]
     ref_texts: list[str | None]
     ref_audio_tokens: list[torch.Tensor | None]
-    ref_rms: list[float | None]
     speed: list[float] | None = None
-
-    def get_indices(self, config: OmniVoiceGenerationConfig, frame_rate: int):
-        threshold = int(config.audio_chunk_threshold * frame_rate)
-        short_idx = [i for i, n in enumerate(self.target_lens) if n <= threshold]
-        long_idx = [i for i, n in enumerate(self.target_lens) if n > threshold]
-        return short_idx, long_idx
-
-    def slice_task(self, indices: list[int]):
-        if not indices:
-            return None
-        return GenerationTask(
-            batch_size=len(indices),
-            texts=[self.texts[i] for i in indices],
-            target_lens=[self.target_lens[i] for i in indices],
-            langs=[self.langs[i] for i in indices],
-            instructs=[self.instructs[i] for i in indices],
-            ref_texts=[self.ref_texts[i] for i in indices],
-            ref_audio_tokens=[self.ref_audio_tokens[i] for i in indices],
-            ref_rms=[self.ref_rms[i] for i in indices],
-            speed=[self.speed[i] for i in indices] if self.speed else None,
-        )
 
 
 @dataclass
 class OmniVoiceModelOutput(ModelOutput):
-    loss: torch.Tensor | None = None
     logits: torch.Tensor | None = None
 
 
@@ -284,22 +155,10 @@ class OmniVoice(PreTrainedModel):
     _supports_sdpa = True
     config_class = OmniVoiceConfig
 
-    def __init__(self, config: OmniVoiceConfig, llm: PreTrainedModel | None = None):
+    def __init__(self, config: OmniVoiceConfig):
         super().__init__(config)
 
-        if llm is not None:
-            # If an LLM instance is provided, use it directly
-            # (skipping config-based init).
-            self.llm = llm
-        else:
-            # Otherwise, initialize the LLM from the config.
-            self.llm = AutoModel.from_config(self.config.llm_config)
-
-        if self.llm.config._attn_implementation == "flex_attention":
-            AttentionInterface.register(
-                _AUTOCAST_FLEX_ATTENTION, _autocast_flex_attention
-            )
-            self.llm.set_attn_implementation(_AUTOCAST_FLEX_ATTENTION)
+        self.llm = AutoModel.from_config(self.config.llm_config)
 
         self.audio_embeddings = nn.Embedding(
             config.num_audio_codebook * config.audio_vocab_size,
@@ -316,11 +175,6 @@ class OmniVoice(PreTrainedModel):
             bias=False,
         )
 
-        self.normalized_audio_codebook_weights = [
-            w / sum(config.audio_codebook_weights)
-            for w in config.audio_codebook_weights
-        ]
-
         self.post_init()
 
         # Inference-only attributes (set by from_pretrained when not in train mode)
@@ -328,16 +182,10 @@ class OmniVoice(PreTrainedModel):
         self.audio_tokenizer = None
         self.duration_estimator = None
         self.sampling_rate = None
-        self._asr_pipe = None
-        self._asr_model_name = "openai/whisper-large-v3-turbo"
-        self._asr_device = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
-        load_asr = kwargs.pop("load_asr", False)
-        asr_model_name = kwargs.pop("asr_model_name", None)
-        asr_device = kwargs.pop("asr_device", None)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
@@ -374,101 +222,13 @@ class OmniVoice(PreTrainedModel):
                 model.sampling_rate = model.feature_extractor.sampling_rate
 
                 model.duration_estimator = RuleDurationEstimator()
-
-                if asr_model_name is not None:
-                    model._asr_model_name = asr_model_name
-                if asr_device is not None:
-                    model._asr_device = asr_device
-                if load_asr:
-                    model.load_asr_model()
         finally:
             logging.disable(_prev_disable)
 
         return model
 
-    # -------------------------------------------------------------------
-    # ASR support (optional, for auto-transcription)
-    # -------------------------------------------------------------------
-
-    def load_asr_model(
-        self, model_name: str | None = None, device: str | None = None
-    ):
-        """Load a Whisper ASR model for reference audio transcription.
-
-        Args:
-            model_name: HuggingFace model name or local path for the Whisper
-                model. Defaults to the ``asr_model_name`` passed to
-                :meth:`from_pretrained` (``openai/whisper-large-v3-turbo``
-                if unset).
-            device: Device to load the ASR model on (e.g. ``"cuda:1"`` or
-                ``"cpu"``). Defaults to the ``asr_device`` passed to
-                :meth:`from_pretrained`, falling back to the main model's
-                device (its first shard when sharded across GPUs).
-        """
-        from transformers import pipeline as hf_pipeline
-
-        if model_name is None:
-            model_name = self._asr_model_name
-        if device is None:
-            device = self._asr_device if self._asr_device is not None else self.device
-
-        logger.info("Loading ASR model %s ...", model_name)
-        asr_dtype = (
-            torch.float16 if str(device).startswith(("cuda", "xpu")) else torch.float32
-        )
-
-        model_name = _resolve_model_path(model_name)
-
-        # Use `device=` (single-device placement) rather than `device_map=`:
-        # pipeline() ignores a plain device string in `device_map` and
-        # auto-selects an accelerator, which is why the ASR model could not
-        # be moved off the default GPU (#180).
-        self._asr_pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model=model_name,
-            dtype=asr_dtype,
-            device=device,
-        )
-        logger.info("ASR model loaded on %s.", device)
-
-    @torch.inference_mode()
-    def transcribe(
-        self,
-        audio: str | tuple,
-    ) -> str:
-        """Transcribe audio using the loaded Whisper ASR model.
-
-        Args:
-            audio: File path or ``(waveform, sample_rate)`` tuple.
-                Waveform can be a numpy array or torch.Tensor of shape
-                ``(1, T)`` or ``(T,)``.
-
-        Returns:
-            Transcribed text.
-        """
-        if self._asr_pipe is None:
-            raise RuntimeError(
-                "ASR model is not loaded. Call model.load_asr_model() first."
-            )
-
-        if isinstance(audio, str):
-            return self._asr_pipe(audio)["text"].strip()
-        else:
-            waveform, sr = audio
-            if isinstance(waveform, torch.Tensor):
-                waveform = waveform.cpu().numpy()
-            waveform = np.squeeze(waveform)  # (1, T) or (T,) → (T,)
-            audio_input = {
-                "array": waveform,
-                "sampling_rate": sr,
-            }
-            return self._asr_pipe(audio_input)["text"].strip()
-
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.llm.set_input_embeddings(value)
 
     def _prepare_embed_inputs(
         self, input_ids: torch.Tensor, audio_mask: torch.Tensor
@@ -496,41 +256,16 @@ class OmniVoice(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         audio_mask: torch.Tensor,
-        labels: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        document_ids: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-    ):
+    ) -> OmniVoiceModelOutput:
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
-
-        if attention_mask is None and document_ids is not None:
-            if not _flex_attention_available:
-                raise RuntimeError(
-                    "flex_attention is not available in the current environment. "
-                    "If you do not need flex_attention, set "
-                    '"attn_implementation": "sdpa" in your training config.'
-                )
-            attention_mask = create_block_mask(
-                _get_packed_mask(
-                    document_ids[0].to(inputs_embeds.device),
-                ),
-                B=None,
-                H=None,
-                Q_LEN=input_ids.size(-1),
-                KV_LEN=input_ids.size(-1),
-                _compile=True,
-                device=inputs_embeds.device,
-            )
 
         llm_outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             return_dict=True,
-            position_ids=position_ids,
         )
         hidden_states = llm_outputs[0]
-
-        loss = None
 
         # Shape: [B, S, C * Vocab]
         batch_size, seq_len, _ = hidden_states.shape
@@ -543,33 +278,7 @@ class OmniVoice(PreTrainedModel):
             self.config.audio_vocab_size,
         ).permute(0, 2, 1, 3)
 
-        if labels is not None:
-            # audio_logits.permute(0, 3, 1, 2):
-            # [Batch, Layer, Seq, Vocab] -> [Batch, Vocab, Layer, Seq]
-            # per_token_loss shape: [Batch, Layer, Seq]，ignore -100
-            per_token_loss = torch.nn.functional.cross_entropy(
-                audio_logits.permute(0, 3, 1, 2),
-                labels,
-                reduction="none",
-                ignore_index=-100,
-            )
-            # valid_mask shape: [Batch, Layer, Seq]
-            valid_mask = (labels != -100).float()
-
-            # layer_means shape: [num_layers]
-            layer_means = (per_token_loss * valid_mask).sum(
-                dim=(0, 2)
-            ) / valid_mask.sum(dim=(0, 2)).clamp(min=1.0)
-
-            weights = torch.tensor(
-                self.normalized_audio_codebook_weights, device=audio_logits.device
-            )
-            loss = (layer_means * weights).sum()
-
-        return OmniVoiceModelOutput(
-            loss=loss,
-            logits=audio_logits,
-        )
+        return OmniVoiceModelOutput(logits=audio_logits)
 
     def supported_language_ids(self) -> set[str]:
         """Return a list of supported language IDs."""
@@ -586,57 +295,36 @@ class OmniVoice(PreTrainedModel):
     @torch.inference_mode()
     def generate(
         self,
-        text: str | list[str],
-        language: str | list[str] | None = None,
-        ref_text: str | list[str] | None = None,
-        ref_audio: str | list[str] | tuple[torch.Tensor, int] | list[tuple[torch.Tensor, int]] | None = None,
-        voice_clone_prompt: VoiceClonePrompt | list[VoiceClonePrompt] | None = None,
-        instruct: str | list[str] | None = None,
-        duration: float | list[float | None] | None = None,
-        speed: float | list[float | None] | None = None,
+        text: str,
+        language: str | None = None,
+        *,
+        instruct: str | None = None,
+        duration: float | None = None,
+        speed: float | None = None,
         generation_config: OmniVoiceGenerationConfig | None = None,
-        normalize_text: bool = False,
         **kwargs,
     ) -> list[np.ndarray]:
-        """Generate speech audio given text in various modes.
+        """Generate speech audio for one text.
 
-        Supports three modes:
+        Supports two modes:
 
-        1. **Voice clone** — clone the voice style from the reference audio.
-            Should provide ``voice_clone_prompt`` (from
-           :meth:`create_voice_clone_prompt`) or ``ref_text`` + ``ref_audio``.
-        2. **Voice design** — provide ``instruct`` text describing
-           the desired voice style; no reference audio needed.
-        3. **Auto** — provide neither; the model picks a voice itself.
+        1. **Voice design** — provide ``instruct`` text describing
+           the desired voice style.
+        2. **Auto** — omit it; the model picks a voice itself.
+
+        Everything after ``language`` is keyword-only.
 
         Args:
-            text: Target text (single string or list for batch).
+            text: Target text, a single ``str`` (a list raises ``TypeError``).
             language: Language name (e.g. ``"English"``) or code
                 (e.g. ``"en"``). ``None`` for language-agnostic mode.
                 Performance is slightly better if you specify the language.
-            ref_text: Optional reference text for voice cloning mode.
-            ref_audio: Optional reference audio for voice cloning mode.
-                Can be a file path or a (waveform, sample_rate) tuple.
-            voice_clone_prompt: Reusable prompt from :meth:`create_voice_clone_prompt`
-                or :meth:`VoiceClonePrompt.load`.
-                If provided, it overrides ``ref_text`` and ``ref_audio``.
             instruct: Style instruction for voice design mode.
-            duration: Fixed output duration in seconds. If a single float,
-                applies to all items; if a list, one value per item.
-                ``None`` (default) lets the model estimate duration from text.
+            duration: Fixed output duration in seconds. ``None`` (default)
+                lets the model estimate duration from text.
                 Overrides ``speed`` when both are provided.
             speed: Speaking speed factor. ``> 1.0`` for faster, ``< 1.0`` for
-                slower. If a list, one value per item. ``None`` (default) uses
-                the model's default estimation.
-            normalize_text: If ``True``, run text normalization on the target
-                text before synthesis (numbers, dates, currency, etc. are
-                converted to their spoken form, e.g. ``"2345"`` ->
-                ``"twenty three forty five"``). Default ``False`` (paper
-                reproducibility is unaffected). Chinese/English require the
-                optional ``omnivoice[tn]`` dependency (WeTextProcessing); other
-                languages use ``num2words`` for bare integers when installed.
-                Inline control syntax (``[laughter]``, ``[B EY1 S]``, pinyin
-                tone markers) is preserved. See :func:`omnivoice_tts.utils.text.normalize_text`.
+                slower. ``None`` (default) uses the model's default estimation.
             generation_config: Explicit config object. If provided, takes
                 precedence over ``**kwargs``.
             **kwargs: Generation config or its fields:
@@ -658,9 +346,9 @@ class OmniVoice(PreTrainedModel):
                 fade_duration: Fade-in/out curve duration in seconds
                     (0 to disable).
         Returns:
-            ``audios`` a list of 1-D ``np.ndarray`` with shape ``(T,)`` and
-            sampling rate consistent with the model's audio tokenizer
-            (usually 24 000 Hz).  Can be saved directly with
+            A list with one 1-D float32 ``np.ndarray`` of shape ``(T,)`` at
+            ``model.sampling_rate`` (usually 24 000 Hz). Save it e.g. with
+            soundfile (not a dependency):
             ``soundfile.write("out.wav", audios[0], model.sampling_rate)``.
         """
 
@@ -677,166 +365,26 @@ class OmniVoice(PreTrainedModel):
 
         self.eval()
 
-        full_task = self._preprocess_all(
-            text=text,
-            language=language,
-            ref_text=ref_text,
-            ref_audio=ref_audio,
-            voice_clone_prompt=voice_clone_prompt,
-            instruct=instruct,
-            preprocess_prompt=gen_config.preprocess_prompt,
-            speed=speed,
-            duration=duration,
-            normalize_text=normalize_text,
-        )
+        task = self._preprocess_all(text, language, instruct, duration, speed)
 
-        short_idx, long_idx = full_task.get_indices(
-            gen_config, self.audio_tokenizer.config.frame_rate
-        )
-
-        results = [None] * full_task.batch_size
-
-        if short_idx:
-            short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
-            for idx, res in zip(short_idx, short_results):
-                results[idx] = res
-
-        if long_idx:
-            long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
-            for idx, res in zip(long_idx, long_results):
-                results[idx] = res
-
-        generated_audios = []
-        for i in range(full_task.batch_size):
-            assert results[i] is not None, f"Result {i} was not generated"
-            generated_audios.append(
-                self._decode_and_post_process(
-                    results[i],
-                    full_task.ref_rms[i],
-                    gen_config,  # type: ignore[arg-type]
-                )
-            )
-
-        return generated_audios
-
-    def create_voice_clone_prompt(
-        self,
-        ref_audio: str | tuple[torch.Tensor, int],
-        ref_text: str | None = None,
-        preprocess_prompt: bool = True,
-    ) -> VoiceClonePrompt:
-        """Create a reusable voice clone prompt from reference audio.
-
-        Args:
-            ref_audio: File path (str) or ``(waveform, sample_rate)`` tuple.
-                waveform should be a 1-D or 2-D torch.Tensor (channels x samples).
-            ref_text: Transcript of the reference audio. If ``None``, the
-                ASR model will be used to auto-transcribe (must call
-                :meth:`load_asr_model` first).
-            preprocess_prompt: If ``True`` (default), apply silence removal and
-                trimming to the reference audio, add punctuation in the end
-                of reference text (if not already)
-
-        Returns:
-            A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
-        """
-        if self.audio_tokenizer is None:
-            raise RuntimeError(
-                "Audio tokenizer is not loaded. Make sure you loaded the model "
-                "with OmniVoice.from_pretrained()."
-            )
-
-        if isinstance(ref_audio, str):
-            ref_wav = load_audio(ref_audio, self.sampling_rate)
+        if task.target_lens[0] > int(
+            gen_config.audio_chunk_threshold * self.audio_tokenizer.config.frame_rate
+        ):
+            tokens = self._generate_chunked(task, gen_config)
         else:
-            waveform, sr = ref_audio
-            if isinstance(waveform, torch.Tensor):
-                waveform = waveform.cpu().numpy()
-            if waveform.ndim == 1:
-                waveform = waveform[np.newaxis, :]
-            if waveform.shape[0] > 1:
-                waveform = np.mean(waveform, axis=0, keepdims=True)
-            if sr != self.sampling_rate:
-                waveform = torchaudio.functional.resample(
-                    torch.from_numpy(waveform),
-                    orig_freq=sr,
-                    new_freq=self.sampling_rate,
-                ).numpy()
-            ref_wav = waveform
+            tokens = self._generate_iterative(task, gen_config)[0]
 
-        ref_rms = float(np.sqrt(np.mean(ref_wav**2)))
-        if 0 < ref_rms < 0.1:
-            ref_wav = ref_wav * 0.1 / ref_rms
-
-        if preprocess_prompt:
-            # Trim long reference audio (>20s) by splitting at the largest silence gap.
-            # Skip trimming when ref_text is user-provided, otherwise the
-            # trimmed audio will no longer match the full transcript.
-            if ref_text is None:
-                ref_wav = trim_long_audio(
-                    ref_wav, self.sampling_rate, trim_threshold=20.0
-                )
-            ref_wav = remove_silence(
-                ref_wav,
-                self.sampling_rate,
-                mid_sil=200,
-                lead_sil=100,
-                trail_sil=200,
-            )
-            if ref_wav.shape[-1] == 0:
-                raise ValueError(
-                    "Reference audio is empty after silence removal. "
-                    "Try setting preprocess_prompt=False."
-                )
-
-        ref_duration = ref_wav.shape[-1] / self.sampling_rate
-        if ref_duration > 20.0:
-            logger.warning(
-                "Reference audio is %.1fs long (>20s). This may cause slower "
-                "generation, higher memory usage, and degraded voice cloning "
-                "quality. We recommend trimming it to 3-10s.",
-                ref_duration,
-            )
-
-        # Auto-transcribe if ref_text not provided
-        if ref_text is None:
-            if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
-            ref_text = self.transcribe((ref_wav, self.sampling_rate))
-            logger.debug("Auto-transcribed ref_text: %s", ref_text)
-
-        chunk_size = self.audio_tokenizer.config.hop_length
-        clip_size = int(ref_wav.shape[-1] % chunk_size)
-        ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
-        # numpy → torch at tokenizer boundary
-        ref_wav_tensor = torch.from_numpy(ref_wav).to(self.audio_tokenizer.device)
-        ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav_tensor.unsqueeze(0),
-        ).audio_codes.squeeze(0)  # (C, T)
-
-        if preprocess_prompt:
-            ref_text = add_punctuation(ref_text)
-
-        return VoiceClonePrompt(
-            ref_audio_tokens=ref_audio_tokens,
-            ref_text=ref_text,
-            ref_rms=ref_rms,
-        )
+        return [self._decode_and_post_process(tokens, gen_config)]
 
     def _decode_and_post_process(
         self,
         tokens: torch.Tensor | list[torch.Tensor],
-        rms: float | None,
         gen_config: OmniVoiceGenerationConfig,
     ) -> np.ndarray:
         """
         Args:
             tokens: Audio tokens — either a single tensor of shape
                 (num_codebooks, seq_len) or a list of chunk tensors.
-            rms: RMS of the reference audio for volume adjustment.
             gen_config: Generation config for post-processing options.
         Returns:
             Decoded and post-processed audio array of shape (T,).
@@ -859,24 +407,18 @@ class OmniVoice(PreTrainedModel):
                 .numpy()
             )
 
-        audio_waveform = self._post_process_audio(
-            audio_waveform,
-            ref_rms=rms,
-            gen_config=gen_config,
-        )
+        audio_waveform = self._post_process_audio(audio_waveform, gen_config)
         return audio_waveform.squeeze(0)
 
     def _post_process_audio(
         self,
         generated_audio: np.ndarray,
-        ref_rms: float | None,
         gen_config: OmniVoiceGenerationConfig,
     ) -> np.ndarray:
         """Optionally remove long silences, adjust volume, and add edge padding.
 
         Args:
             generated_audio: Numpy array of shape (1, T).
-            ref_rms: RMS of the reference audio for volume normalisation.
             gen_config: Generation config controlling post-processing behaviour.
         Returns:
             Processed numpy array of shape (1, T).
@@ -890,12 +432,9 @@ class OmniVoice(PreTrainedModel):
                 trail_sil=100,
             )
 
-        if ref_rms is not None and ref_rms < 0.1:
-            generated_audio = generated_audio * ref_rms / 0.1
-        elif ref_rms is None:
-            peak = np.abs(generated_audio).max()
-            if peak > 1e-6:
-                generated_audio = generated_audio / peak * 0.5
+        peak = np.abs(generated_audio).max()
+        if peak > 1e-6:
+            generated_audio = generated_audio / peak * 0.5
 
         generated_audio = fade_and_pad_audio(
             generated_audio,
@@ -907,251 +446,85 @@ class OmniVoice(PreTrainedModel):
 
     def _generate_chunked(
         self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
-    ) -> list[list[torch.Tensor]]:
-        """Generate long audio by splitting text into chunks and batching.
+    ) -> list[torch.Tensor]:
+        """Generate long audio by splitting the text into chunks.
 
-        Each item in the returned list corresponds to one input and contains
-        a list of audio token tensors — one per text chunk.
+        Chunk 0 is generated without a reference; every later chunk is
+        prompted with chunk 0's tokens and text.
 
         Args:
-            task: A :class:`GenerationTask` with one or more items whose
-                estimated audio exceeds ``audio_chunk_threshold``.
+            task: A one-item :class:`GenerationTask` whose estimated audio
+                exceeds ``audio_chunk_threshold``.
             gen_config: Generation config (``audio_chunk_duration`` controls
                 chunk size).
         Returns:
-            Per-item list of chunk token-tensor lists.
+            The audio token tensors, one per text chunk.
         """
-        # Chunk each item's text
-        all_chunks = []
-        for i in range(task.batch_size):
-            avg_tokens_per_char = task.target_lens[i] / len(task.texts[i])
-            text_chunk_len = int(
-                gen_config.audio_chunk_duration
-                * self.audio_tokenizer.config.frame_rate
-                / avg_tokens_per_char
-            )
-            chunks = chunk_text_punctuation(
-                text=task.texts[i],
-                chunk_len=text_chunk_len,
-                min_chunk_len=3,
-            )
-            logger.debug(f"Item {i} chunked into {len(chunks)} pieces: {chunks}")
-            all_chunks.append(chunks)
-
-        has_ref = [t is not None for t in task.ref_audio_tokens]
-        assert all(has_ref) or not any(has_ref), (
-            "Chunked inference requires all items to either have or not have "
-            "ref_audio. Mixed ref/non-ref is not supported."
+        avg_tokens_per_char = task.target_lens[0] / len(task.texts[0])
+        text_chunk_len = int(
+            gen_config.audio_chunk_duration
+            * self.audio_tokenizer.config.frame_rate
+            / avg_tokens_per_char
         )
+        chunks = chunk_text_punctuation(
+            text=task.texts[0],
+            chunk_len=text_chunk_len,
+            min_chunk_len=3,
+        )
+        logger.debug("Text chunked into %d pieces: %s", len(chunks), chunks)
 
-        max_num_chunks = max(len(c) for c in all_chunks)
-
-        # chunk_results[item_idx] = list of generated token tensors per chunk
-        chunk_results = [[] for _ in range(task.batch_size)]
-
-        def _run_batch(indices, texts, ref_audios, ref_texts):
-            speed_list = task.speed
-            target_lens = [
-                self._estimate_target_tokens(
-                    texts[j],
-                    ref_texts[j],
-                    ref_audios[j].size(-1) if ref_audios[j] is not None else None,
-                    speed=speed_list[i] if speed_list else 1.0,
-                )
-                for j, i in enumerate(indices)
-            ]
+        speed = task.speed[0] if task.speed else 1.0
+        tokens = []
+        for chunk in chunks:
+            ref_text, ref_tokens = (chunks[0], tokens[0]) if tokens else (None, None)
             sub_task = GenerationTask(
-                batch_size=len(indices),
-                texts=texts,
-                target_lens=target_lens,
-                langs=[task.langs[i] for i in indices],
-                instructs=[task.instructs[i] for i in indices],
-                ref_texts=ref_texts,
-                ref_audio_tokens=ref_audios,
-                ref_rms=[task.ref_rms[i] for i in indices],
-                speed=[task.speed[i] for i in indices] if task.speed else None,
+                batch_size=1,
+                texts=[chunk],
+                target_lens=[
+                    self._estimate_target_tokens(
+                        chunk,
+                        ref_text,
+                        ref_tokens.size(-1) if ref_tokens is not None else None,
+                        speed=speed,
+                    )
+                ],
+                langs=task.langs,
+                instructs=task.instructs,
+                ref_texts=[ref_text],
+                ref_audio_tokens=[ref_tokens],
+                speed=task.speed,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
-            for j, idx in enumerate(indices):
-                chunk_results[idx].append(gen_tokens[j])
-
-        if all(has_ref):
-            # All items have reference audio.
-            # We still sequentially generate chunks within each item, but we
-            # batch across items for the same chunk index. This allows to keep
-            # the VRAM usage manageable while still benefiting from batching.
-            for ci in range(max_num_chunks):
-                indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
-                if not indices:
-                    continue
-                _run_batch(
-                    indices,
-                    texts=[all_chunks[i][ci] for i in indices],
-                    ref_audios=[task.ref_audio_tokens[i] for i in indices],
-                    ref_texts=[task.ref_texts[i] for i in indices],
-                )
-        else:
-            # No reference audio — generate chunk 0 for all items first,
-            # then use chunk 0 output as reference for all subsequent chunks.
-            indices_0 = [i for i in range(task.batch_size) if len(all_chunks[i]) > 0]
-            _run_batch(
-                indices_0,
-                texts=[all_chunks[i][0] for i in indices_0],
-                ref_audios=[None] * len(indices_0),
-                ref_texts=[None] * len(indices_0),
-            )
-            first_chunk_map = {idx: chunk_results[idx][0] for idx in indices_0}
-
-            # Batch all remaining chunks, using chunk 0 as fixed reference
-            for ci in range(1, max_num_chunks):
-                indices = [i for i in range(task.batch_size) if ci < len(all_chunks[i])]
-                if not indices:
-                    continue
-                _run_batch(
-                    indices,
-                    texts=[all_chunks[i][ci] for i in indices],
-                    ref_audios=[first_chunk_map[i] for i in indices],
-                    ref_texts=[all_chunks[i][0] for i in indices],
-                )
-
-        return chunk_results
+            tokens.append(self._generate_iterative(sub_task, gen_config)[0])
+        return tokens
 
     def _preprocess_all(
         self,
-        text: str | list[str],
-        language: str | list[str] | None = None,
-        ref_text: str | list[str] | None = None,
-        ref_audio: str | list[str] | tuple[torch.Tensor, int] | list[tuple[torch.Tensor, int]] | None = None,
-        voice_clone_prompt: VoiceClonePrompt | list[VoiceClonePrompt] | None = None,
-        instruct: str | list[str] | None = None,
-        preprocess_prompt: bool = True,
-        speed: float | list[float | None] | None = None,
-        duration: float | list[float | None] | None = None,
-        normalize_text: bool = False,
+        text: str,
+        language: str | None = None,
+        instruct: str | None = None,
+        duration: float | None = None,
+        speed: float | None = None,
     ) -> GenerationTask:
-        if isinstance(text, str):
-            text_list = [text]
-        else:
-            assert isinstance(text, list), (
-                "text should be a string or a list of strings"
-            )
-            text_list = text
-        batch_size = len(text_list)
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, got {type(text).__name__}")
+        language = _resolve_language(language)
+        instruct = None if instruct is None else _resolve_instruct(instruct, use_zh=bool(_ZH_RE.search(text)))
 
-        language_list = self._ensure_list(language, batch_size)
-        language_list = [_resolve_language(lang) for lang in language_list]
-
-        # Optional text normalization (opt-in). Applied to the target text only
-        # (not ref_text, which must stay aligned with the reference audio),
-        # before duration estimation so the estimate matches the spoken form.
-        if normalize_text:
-            text_list = [
-                _normalize_text(t, lang) for t, lang in zip(text_list, language_list)
-            ]
-        instruct_list = self._ensure_list(instruct, batch_size)
-        for i, s in enumerate(instruct_list):
-            if s is None:
-                continue
-            use_zh = bool(text_list[i] and _ZH_RE.search(text_list[i]))
-            instruct_list[i] = _resolve_instruct(s, use_zh=use_zh)
-
-        if voice_clone_prompt is not None and (
-            ref_text is not None or ref_audio is not None
-        ):
-            logger.warning(
-                "Both voice_clone_prompt and ref_text/ref_audio are provided. "
-                "ref_text/ref_audio will be ignored."
-            )
-        if voice_clone_prompt is None and ref_audio is not None:
-            # If voice_clone_prompt is not provided, create it from
-            # ref_audio (ref_text will be auto-transcribed if not given).
-            ref_text_list = self._ensure_list(ref_text, batch_size, auto_repeat=False)
-            ref_audio_list = self._ensure_list(ref_audio, batch_size, auto_repeat=False)
-
-            voice_clone_prompt = []
-            for i in range(len(ref_text_list)):
-                voice_clone_prompt.append(
-                    self.create_voice_clone_prompt(
-                        ref_audio=ref_audio_list[i],
-                        ref_text=ref_text_list[i],
-                        preprocess_prompt=preprocess_prompt,
-                    )
-                )
-
-        voice_clone_prompt_list = self._ensure_list(voice_clone_prompt, batch_size)
-        if voice_clone_prompt_list[0] is not None:
-            ref_text_list = [vc.ref_text for vc in voice_clone_prompt_list]
-            ref_audio_tokens_list = [
-                vc.ref_audio_tokens for vc in voice_clone_prompt_list
-            ]
-            ref_rms_list = [vc.ref_rms for vc in voice_clone_prompt_list]
-        else:
-            ref_text_list = [None] * batch_size
-            ref_audio_tokens_list = [None] * batch_size
-            ref_rms_list = [None] * batch_size
-
-        # Normalize speed/duration to per-item lists (may contain None).
-        if speed is not None:
-            if isinstance(speed, (int, float)):
-                user_speed = [float(speed)] * batch_size
-            else:
-                user_speed = list(speed)
-        else:
-            user_speed = None
-
-        if duration is not None:
-            if isinstance(duration, (int, float)):
-                durations = [float(duration)] * batch_size
-            else:
-                durations = list(duration)
-        else:
-            durations = None
-
-        num_target_tokens_list = []
-        for i in range(batch_size):
-            # duration[i] overrides speed for estimation: use speed=1.0
-            # to get the raw estimate, then override target_lens below.
-            has_dur = durations is not None and durations[i] is not None
-            item_speed = 1.0 if has_dur else (user_speed[i] if user_speed else 1.0)
-            est = self._estimate_target_tokens(
-                text_list[i],
-                ref_text_list[i],
-                ref_audio_tokens_list[i].size(-1)
-                if ref_audio_tokens_list[i] is not None
-                else None,
-                speed=item_speed,
-            )
-            num_target_tokens_list.append(est)
-
-        # Per-item duration overrides: set target_lens to exact frame count
-        # and compute speed ratio so chunked generation scales proportionally.
-        speed_list: list[float] | None = None
-        if durations is not None:
-            frame_rate = self.audio_tokenizer.config.frame_rate
-            speed_list = []
-            for i in range(batch_size):
-                if durations[i] is not None:
-                    target_tokens = max(1, int(durations[i] * frame_rate))
-                    est = num_target_tokens_list[i]
-                    speed_list.append(est / target_tokens if target_tokens > 0 else 1.0)
-                    num_target_tokens_list[i] = target_tokens
-                else:
-                    s = user_speed[i] if user_speed else None
-                    speed_list.append(s if s is not None else 1.0)
-        elif user_speed is not None:
-            speed_list = [s if s is not None else 1.0 for s in user_speed]
-
-        return GenerationTask(
-            batch_size=batch_size,
-            texts=text_list,
-            target_lens=num_target_tokens_list,
-            langs=language_list,
-            instructs=instruct_list,
-            ref_texts=ref_text_list,
-            ref_audio_tokens=ref_audio_tokens_list,
-            ref_rms=ref_rms_list,
-            speed=speed_list,
+        # duration overrides speed for estimation: use speed=1.0 to get the raw
+        # estimate, then override the target length below.
+        est = self._estimate_target_tokens(
+            text, None, None, speed=1.0 if duration is not None else (float(speed) if speed is not None else 1.0)
         )
+        if duration is not None:
+            # Exact frame count, and a speed ratio so chunked generation
+            # scales proportionally.
+            target = max(1, int(float(duration) * self.audio_tokenizer.config.frame_rate))
+            speed_list = [est / target]
+            est = target
+        else:
+            speed_list = [float(speed)] if speed is not None else None
+
+        return GenerationTask(1, [text], [est], [language], [instruct], [None], [None], speed_list)
 
     def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
         """Estimate number of target audio tokens."""
@@ -1166,21 +539,6 @@ class OmniVoice(PreTrainedModel):
         if speed > 0 and speed != 1.0:
             est = est / speed
         return max(1, int(est))
-
-    def _ensure_list(
-        self, x: Any | list[Any], batch_size: int, auto_repeat: bool = True
-    ) -> list[Any]:
-        x_list = x if isinstance(x, list) else [x]
-        if len(x_list) not in (
-            1,
-            batch_size,
-        ):
-            raise ValueError(
-                f"should be either the number of the text or 1, but got {len(x_list)}"
-            )
-        if auto_repeat and len(x_list) == 1 and batch_size is not None:
-            x_list = x_list * batch_size
-        return x_list
 
     def _prepare_inference_inputs(
         self,
@@ -1444,18 +802,6 @@ class OmniVoice(PreTrainedModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_packed_mask(document_ids):
-    return partial(_mask_mod_packed, document_ids)
-
-
-def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
-    # 1. Sequence Packing Logic: Tokens must belong to the same document.
-    # Note: The doc_id for padding tokens is -1, which will automatically not match
-    # (if handled correctly) or be ignored.
-    same_doc = document_ids[q_idx] == document_ids[kv_idx]
-    return same_doc
-
-
 def _resolve_language(language: str | None) -> str | None:
     from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
 
@@ -1479,133 +825,33 @@ def _resolve_language(language: str | None) -> str | None:
 def _resolve_instruct(
     instruct: str | None, use_zh: bool = False
 ) -> str | None:
-    """Validate and normalise a voice-design instruct string.
+    """Normalise a voice-design instruct string; nothing is rejected.
 
-    Supported instruct items (case-insensitive for English):
-
-    English (comma + space separated):
-        gender: male, female
-        age: child, teenager, young adult, middle-aged, elderly
-        pitch: very low pitch, low pitch, moderate pitch,
-               high pitch, very high pitch
-        style: whisper
-        accent: american accent, british accent, australian accent, ...
-
-    Chinese (full-width comma separated):
-        gender: 男, 女
-        age: 儿童, 少年, 青年, 中年, 老年
-        pitch: 极低音调, 低音调, 中音调, 高音调, 极高音调
-        style: 耳语
-        dialect: 河南话, 陕西话, 四川话, 贵州话, 云南话,
-                 桂林话, 济南话, 石家庄话, 甘肃话, 宁夏话,
-                 青岛话, 东北话
-
-    Minor issues (auto-fixed):
-      - Wrong separator (half-width comma in Chinese instruct or
-        full-width comma in English instruct)
-      - Leading / trailing commas
-
-    Major issues (raise ``ValueError``):
-      - Unsupported or misspelled instruct items
-      - Suggestions are offered for close matches
+    The string is split on half- and full-width commas, and each item is
+    stripped and lowercased. Items of upstream's bilingual vocabulary are
+    unified to one language: a Chinese dialect (``...话``) forces Chinese, an
+    English accent (``... accent``) forces English, otherwise ``use_zh``
+    decides. Any other item passes through unchanged. Items are joined with a
+    full-width comma when any of them is Chinese, else with ``", "``.
 
     Args:
         instruct: Raw instruct string, or ``None``.
-        use_zh: If True, normalise all items to Chinese (used when the
+        use_zh: If True, normalise items to Chinese (used when the
             synthesis text contains Chinese and no accent is specified).
 
     Returns:
-        Normalised instruct string, or ``None``.
-
-    Raises:
-        ValueError: if any instruct item is unsupported or misspelled.
+        Normalised instruct string, or ``None`` if it is empty.
     """
-    if instruct is None:
+    if instruct is None or not instruct.strip():
         return None
-
-    instruct_str = instruct.strip()
-    if not instruct_str:
-        return None
-
-    # Split on both half-width and full-width commas
-    raw_items = re.split(r"\s*[,，]\s*", instruct_str)
-    raw_items = [x for x in raw_items if x]
-
-    # Validate each item
-    unknown = []
-    normalised = []
-    for raw in raw_items:
-        n = raw.strip().lower()
-        if n in _INSTRUCT_ALL_VALID:
-            normalised.append(n)
-        else:
-            sug = difflib.get_close_matches(n, _INSTRUCT_ALL_VALID, n=1, cutoff=0.6)
-            unknown.append((raw, n, sug[0] if sug else None))
-
-    if unknown:
-        lines = []
-        for raw, n, sug in unknown:
-            if sug:
-                lines.append(f"  '{raw}' -> '{n}' (unsupported; did you mean '{sug}'?)")
-            else:
-                lines.append(f"  '{raw}' -> '{n}' (unsupported)")
-        err = (
-            f"Unsupported instruct items found in {instruct_str}:\n"
-            + "\n".join(lines)
-            + "\n\nValid English items: "
-            + ", ".join(sorted(_INSTRUCT_VALID_EN))
-            + "\nValid Chinese items: "
-            + "，".join(sorted(_INSTRUCT_VALID_ZH))
-            + "\n\nTip: Use only English or only Chinese instructs. "
-            "English instructs should use comma + space (e.g. "
-            "'male, indian accent'),\nChinese instructs should use full-width "
-            "comma (e.g. '男，河南话')."
-        )
-        raise ValueError(err)
-
-    # --- Language consistency: dialect forces Chinese, accent forces English ---
-    has_dialect = any(n.endswith("话") for n in normalised)
-    has_accent = any(" accent" in n for n in normalised)
-
-    if has_dialect and has_accent:
-        raise ValueError(
-            "Cannot mix Chinese dialect and English accent in a single instruct. "
-            "Dialects are for Chinese speech, accents for English speech."
-        )
-
-    if has_dialect:
+    items = [x.strip().lower() for x in re.split(r"\s*[,，]\s*", instruct.strip()) if x]
+    if any(n.endswith("话") for n in items):  # a dialect forces Chinese
         use_zh = True
-    elif has_accent:
+    elif any(" accent" in n for n in items):  # an accent forces English
         use_zh = False
-
-    # --- Unify to single language ---
-    if use_zh:
-        normalised = [_INSTRUCT_EN_TO_ZH.get(n, n) for n in normalised]
-    else:
-        normalised = [_INSTRUCT_ZH_TO_EN.get(n, n) for n in normalised]
-
-    # --- Category conflict check ---
-    conflicts = []
-    for cat in _INSTRUCT_MUTUALLY_EXCLUSIVE:
-        hits = [n for n in normalised if n in cat]
-        if len(hits) > 1:
-            conflicts.append(hits)
-    if conflicts:
-        parts = []
-        for group in conflicts:
-            parts.append(" vs ".join(f"'{x}'" for x in group))
-        raise ValueError(
-            "Conflicting instruct items within the same category: "
-            + "; ".join(parts)
-            + ". Each category (gender, age, pitch, style, accent, dialect) "
-            "allows at most one item."
-        )
-
-    # Determine separator based on language
-    has_zh = any(any("\u4e00" <= c <= "\u9fff" for c in n) for n in normalised)
-    separator = "，" if has_zh else ", "
-
-    return separator.join(normalised)
+    mapping = _INSTRUCT_EN_TO_ZH if use_zh else _INSTRUCT_ZH_TO_EN
+    items = [mapping.get(n, n) for n in items]
+    return ("，" if any(any("一" <= c <= "鿿" for c in n) for n in items) else ", ").join(items)
 
 
 def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:

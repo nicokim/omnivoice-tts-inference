@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from conftest import tiny_model
+from conftest import cfg_batch, tiny_model
 from stubs import Recorder, stub_model
 
 import omnivoice_tts.models.omnivoice as ov
@@ -133,3 +133,20 @@ def test_audio_chunk_duration_zero_disables_split():
     text = UP["chunked"][0]["text"]
     assert len(run(text, {"audio_chunk_duration": 0.0})[0].calls) == 1
     assert len(run(text, {})[0].calls) > 1
+
+
+def test_forward_requires_attention_mask():
+    m, (input_ids, audio_mask, attention_mask), seen = tiny_model(), cfg_batch(), []
+    with pytest.raises(TypeError):
+        m(input_ids, audio_mask)
+
+    original = m.llm.forward
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return original(*args, **kwargs)
+
+    m.llm.forward = spy
+    out = m(input_ids, audio_mask, attention_mask)
+    assert out.logits.shape == (2, 8, 40, 1025)
+    assert seen[0]["use_cache"] is False

@@ -144,8 +144,6 @@ def _resolve_model_path(name_or_path: str) -> str:
 
 
 class OmniVoice(PreTrainedModel):
-    _supports_flex_attn = True
-    _supports_flash_attn_2 = True
     _supports_sdpa = True
     config_class = OmniVoiceConfig
 
@@ -250,14 +248,16 @@ class OmniVoice(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         audio_mask: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor,
     ) -> OmniVoiceModelOutput:
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
+        # use_cache=False: no KV cache is ever reused, so building one per step is wasted work
         llm_outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             return_dict=True,
+            use_cache=False,
         )
         hidden_states = llm_outputs[0]
 

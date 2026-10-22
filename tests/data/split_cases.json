@@ -1,0 +1,558 @@
+[
+ [
+  "num",
+  "Son las 21:30. Vamos.",
+  [
+   "Son las 21:30.",
+   "Vamos."
+  ]
+ ],
+ [
+  "num",
+  "Mide 3.5 metros. Es enorme.",
+  [
+   "Mide 3.5 metros.",
+   "Es enorme."
+  ]
+ ],
+ [
+  "num",
+  "Me donaron $1.500 y un alfajor de 300 pesos. Gracias.",
+  [
+   "Me donaron $1.500 y un alfajor de 300 pesos.",
+   "Gracias."
+  ]
+ ],
+ [
+  "num",
+  "El dólar está a $1.250,50. Una locura.",
+  [
+   "El dólar está a $1.250,50.",
+   "Una locura."
+  ]
+ ],
+ [
+  "num",
+  "Stream el sábado 8/11 a las 21 hs. Vengan.",
+  [
+   "Stream el sábado 8/11 a las 21 hs.",
+   "Vengan."
+  ]
+ ],
+ [
+  "num",
+  "Arranco a las 21.30 hs. del sábado.",
+  [
+   "Arranco a las 21.30 hs. del sábado."
+  ]
+ ],
+ [
+  "num",
+  "Van 1-1. Qué partido.",
+  [
+   "Van 1-1.",
+   "Qué partido."
+  ]
+ ],
+ [
+  "num",
+  "Mido 1,62 y peso 50. Soy chiquita.",
+  [
+   "Mido 1,62 y peso 50.",
+   "Soy chiquita."
+  ]
+ ],
+ [
+  "num",
+  "Bajé la versión 1.2.3. Anda mejor.",
+  [
+   "Bajé la versión 1.2.3.",
+   "Anda mejor."
+  ]
+ ],
+ [
+  "num",
+  "Pi es 3.14159 más o menos.",
+  [
+   "Pi es 3.14159 más o menos."
+  ]
+ ],
+ [
+  "num",
+  "Faltan 3 días. El 1° de enero arranco.",
+  [
+   "Faltan 3 días.",
+   "El 1° de enero arranco."
+  ]
+ ],
+ [
+  "num",
+  "El reloj marca las 2:42. La hora perfecta.",
+  [
+   "El reloj marca las 2:42.",
+   "La hora perfecta."
+  ]
+ ],
+ [
+  "num",
+  "Hay 1.000.000 de razones. Elegí una.",
+  [
+   "Hay 1.000.000 de razones.",
+   "Elegí una."
+  ]
+ ],
+ [
+  "url",
+  "Entrá a kohai.com.ar/stream. Dale.",
+  [
+   "Entrá a kohai.com.ar/stream.",
+   "Dale."
+  ]
+ ],
+ [
+  "url",
+  "Escribime a kohai@mail.com. Respondo.",
+  [
+   "Escribime a kohai@mail.com.",
+   "Respondo."
+  ]
+ ],
+ [
+  "url",
+  "Seguime en @kohai.oficial y listo.",
+  [
+   "Seguime en @kohai.oficial y listo."
+  ]
+ ],
+ [
+  "url",
+  "Mirá https://kohai.tv/clip?id=3. Es buenísimo.",
+  [
+   "Mirá https://kohai.tv/clip?id=3.",
+   "Es buenísimo."
+  ]
+ ],
+ [
+  "abbr",
+  "El Sr. Gómez llegó tarde. Como siempre.",
+  [
+   "El Sr. Gómez llegó tarde.",
+   "Como siempre."
+  ]
+ ],
+ [
+  "abbr",
+  "La Sra. Pérez y la Dra. López vinieron.",
+  [
+   "La Sra. Pérez y la Dra. López vinieron."
+  ]
+ ],
+ [
+  "abbr",
+  "Viajé a EE. UU. el año pasado.",
+  [
+   "Viajé a EE. UU. el año pasado."
+  ]
+ ],
+ [
+  "abbr",
+  "Mirá la pág. 5 del libro.",
+  [
+   "Mirá la pág. 5 del libro."
+  ]
+ ],
+ [
+  "abbr",
+  "Pesa aprox. 3 kilos.",
+  [
+   "Pesa aprox. 3 kilos."
+  ]
+ ],
+ [
+  "abbr",
+  "Dr. House es mi serie favorita.",
+  [
+   "Dr. House es mi serie favorita."
+  ]
+ ],
+ [
+  "abbr",
+  "Trajo pan, leche, etc. y se fue.",
+  [
+   "Trajo pan, leche, etc. y se fue."
+  ]
+ ],
+ [
+  "abbr",
+  "Mr. Smith arrived. He sat down.",
+  [
+   "Mr. Smith arrived.",
+   "He sat down."
+  ]
+ ],
+ [
+  "abbr",
+  "Lo escribió J. K. Rowling.",
+  [
+   "Lo escribió J. K. Rowling."
+  ]
+ ],
+ [
+  "abbr",
+  "It costs approx. 5 dollars.",
+  [
+   "It costs approx. 5 dollars."
+  ]
+ ],
+ [
+  "abbr",
+  "¿Dr. House o Sr. Burns? Elegí.",
+  [
+   "¿Dr. House o Sr. Burns?",
+   "Elegí."
+  ]
+ ],
+ [
+  "abbr",
+  "Llamó (Sr. Gómez) y cortó.",
+  [
+   "Llamó (Sr. Gómez) y cortó."
+  ]
+ ],
+ [
+  "abbr",
+  "Chanel No. 5 obvio. Es el perfume.",
+  [
+   "Chanel No. 5 obvio.",
+   "Es el perfume."
+  ]
+ ],
+ [
+  "abbr",
+  "Pasó en el 300 a. C. y nadie se acuerda.",
+  [
+   "Pasó en el 300 a. C. y nadie se acuerda."
+  ]
+ ],
+ [
+  "num",
+  "Una tiene 60 y la otra 70. Las dos son viejas.",
+  [
+   "Una tiene 60 y la otra 70.",
+   "Las dos son viejas."
+  ]
+ ],
+ [
+  "num",
+  "Contá hasta 3. ¡Ya!",
+  [
+   "Contá hasta 3.",
+   "¡Ya!"
+  ]
+ ],
+ [
+  "es",
+  "¿Qué hacés? ¡Hola! Todo bien.",
+  [
+   "¿Qué hacés?",
+   "¡Hola!",
+   "Todo bien."
+  ]
+ ],
+ [
+  "es",
+  "¿En serio?, no te creo.",
+  [
+   "¿En serio?, no te creo."
+  ]
+ ],
+ [
+  "es",
+  "Mis ojos son rosas, ¿sos daltónico o qué? La heterocromía es en el pelo.",
+  [
+   "Mis ojos son rosas, ¿sos daltónico o qué?",
+   "La heterocromía es en el pelo."
+  ]
+ ],
+ [
+  "es",
+  "¡¿Qué?! No puede ser.",
+  [
+   "¡¿Qué?!",
+   "No puede ser."
+  ]
+ ],
+ [
+  "es",
+  "¿Viste?! Te dije.",
+  [
+   "¿Viste?!",
+   "Te dije."
+  ]
+ ],
+ [
+  "es",
+  "Hola!!! Chau???",
+  [
+   "Hola!!!",
+   "Chau???"
+  ]
+ ],
+ [
+  "ell",
+  "Bueno... no sé qué decirte.",
+  [
+   "Bueno... no sé qué decirte."
+  ]
+ ],
+ [
+  "ell",
+  "Bueno... Mañana vemos.",
+  [
+   "Bueno...",
+   "Mañana vemos."
+  ]
+ ],
+ [
+  "ell",
+  "Esperá… ya vuelvo.",
+  [
+   "Esperá… ya vuelvo."
+  ]
+ ],
+ [
+  "ell",
+  "Pelean en cualquier lado: escenario, gimnasio... hasta una mesa usaron.",
+  [
+   "Pelean en cualquier lado: escenario, gimnasio... hasta una mesa usaron."
+  ]
+ ],
+ [
+  "quote",
+  "Me dijo \"chau.\" y se fue.",
+  [
+   "Me dijo \"chau.\" y se fue."
+  ]
+ ],
+ [
+  "quote",
+  "Me dijo: \"Chau.\" Después se fue.",
+  [
+   "Me dijo: \"Chau.\"",
+   "Después se fue."
+  ]
+ ],
+ [
+  "quote",
+  "Esto es (muy) raro. Sí.",
+  [
+   "Esto es (muy) raro.",
+   "Sí."
+  ]
+ ],
+ [
+  "emoji",
+  "Qué risa 😂. Bueno, sigamos.",
+  [
+   "Qué risa 😂.",
+   "Bueno, sigamos."
+  ]
+ ],
+ [
+  "emoji",
+  "Chau. 😀😀",
+  [
+   "Chau. 😀😀"
+  ]
+ ],
+ [
+  "emoji",
+  "😀 Hola. Chau.",
+  [
+   "😀 Hola.",
+   "Chau."
+  ]
+ ],
+ [
+  "nl",
+  "Hola.\nChau.",
+  [
+   "Hola.",
+   "Chau."
+  ]
+ ],
+ [
+  "nl",
+  "Primera línea,\nsegunda línea.",
+  [
+   "Primera línea,\nsegunda línea."
+  ]
+ ],
+ [
+  "nl",
+  "Fin del párrafo.\n\nOtro párrafo.",
+  [
+   "Fin del párrafo.",
+   "Otro párrafo."
+  ]
+ ],
+ [
+  "tag",
+  "[laughter] ¡Ja! Qué bueno.",
+  [
+   "[laughter] ¡Ja!",
+   "Qué bueno."
+  ]
+ ],
+ [
+  "tag",
+  "Qué bueno. [laughter] Bueno, sigamos.",
+  [
+   "Qué bueno.",
+   "[laughter] Bueno, sigamos."
+  ]
+ ],
+ [
+  "tag",
+  "jaja [laughter]. Sí, claro que sí.",
+  [
+   "jaja [laughter].",
+   "Sí, claro que sí."
+  ]
+ ],
+ [
+  "tag",
+  "Qué bueno. [laughter]",
+  [
+   "Qué bueno. [laughter]"
+  ]
+ ],
+ [
+  "tag",
+  "Hola.[laughter] ¿Qué tal?",
+  [
+   "Hola.",
+   "[laughter] ¿Qué tal?"
+  ]
+ ],
+ [
+  "tag",
+  "Ganamos![laughter] Vamos.",
+  [
+   "Ganamos!",
+   "[laughter] Vamos."
+  ]
+ ],
+ [
+  "tag",
+  "[sigh] ... Bueno.",
+  [
+   "[sigh] ... Bueno."
+  ]
+ ],
+ [
+  "tag",
+  "Hola. [laughter]. Chau.",
+  [
+   "Hola.",
+   "[laughter]. Chau."
+  ]
+ ],
+ [
+  "tag",
+  "Me quedan $300 nomás[sigh]. Qué triste.",
+  [
+   "Me quedan $300 nomás[sigh].",
+   "Qué triste."
+  ]
+ ],
+ [
+  "cjk",
+  "你好。今天怎么样？很好！",
+  [
+   "你好。",
+   "今天怎么样？",
+   "很好！"
+  ]
+ ],
+ [
+  "en",
+  "Hello world. This is a test.",
+  [
+   "Hello world.",
+   "This is a test."
+  ]
+ ],
+ [
+  "en",
+  "He paid $3.50. Then he left.",
+  [
+   "He paid $3.50.",
+   "Then he left."
+  ]
+ ],
+ [
+  "en",
+  "Wait... what?",
+  [
+   "Wait... what?"
+  ]
+ ],
+ [
+  "en",
+  "I live in the U.S. now.",
+  [
+   "I live in the U.S. now."
+  ]
+ ],
+ [
+  "ident",
+  "  Hola, ¿qué tal?  ",
+  [
+   "  Hola, ¿qué tal?  "
+  ]
+ ],
+ [
+  "ident",
+  "Hola, ¿qué tal?",
+  [
+   "Hola, ¿qué tal?"
+  ]
+ ],
+ [
+  "ell",
+  "Bueno... ¿qué querés que te diga?",
+  [
+   "Bueno... ¿qué querés que te diga?"
+  ]
+ ],
+ [
+  "quote",
+  "Bueno... \"no sé\" dijo.",
+  [
+   "Bueno... \"no sé\" dijo."
+  ]
+ ],
+ [
+  "ell",
+  "Hola… ¿cómo andás?",
+  [
+   "Hola… ¿cómo andás?"
+  ]
+ ],
+ [
+  "ell",
+  "Esperá… (ya vuelvo).",
+  [
+   "Esperá… (ya vuelvo)."
+  ]
+ ],
+ [
+  "es",
+  "¡Hola! ¿Qué tal?",
+  [
+   "¡Hola!",
+   "¿Qué tal?"
+  ]
+ ]
+]

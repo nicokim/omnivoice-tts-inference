@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -57,7 +58,7 @@ from omnivoice_tts.utils.audio import (
 )
 from omnivoice_tts.utils.duration import RuleDurationEstimator
 from omnivoice_tts.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID, LANG_NAMES
-from omnivoice_tts.utils.text import chunk_text_punctuation
+from omnivoice_tts.utils.text import ABBREVIATIONS, chunk_text_punctuation
 from omnivoice_tts.utils.voice_design import (
     _INSTRUCT_EN_TO_ZH,
     _INSTRUCT_ZH_TO_EN,
@@ -429,6 +430,38 @@ class OmniVoice(PreTrainedModel):
             tokens = self._generate_iterative(task, gen_config, generator)[0]
 
         return [self._decode_and_post_process(tokens, gen_config)]
+
+    def generate_streaming(self, text: str, language: str | None = None, *, instruct: str | None = None,
+                           duration: Callable[[str], float] | None = None, speed: float | None = None,
+                           normalize: Callable[[str, str | None], str] | None = None,
+                           generation_config: OmniVoiceGenerationConfig | None = None,
+                           generator: torch.Generator | None = None,
+                           **kwargs) -> Iterator[tuple[np.ndarray, str]]:
+        """Speak ``text`` one sentence at a time: yield ``(audio, sentence)`` as soon as each is ready.
+
+        ``sentence`` is the raw slice of ``text`` that ``audio`` speaks (tags kept; stripped when there are
+        several). Each item is ``generate(spoken, ...)[0]`` for that sentence alone, so text without a
+        sentence break yields exactly ``generate(text, ...)[0]``. ``normalize(sentence, language) -> str``
+        turns a sentence into the text the model speaks (``TextNormalizer(...).normalize`` fits); a sentence
+        it leaves with nothing to say is skipped. ``duration(spoken) -> seconds`` is called on that text,
+        because one float cannot be split across sentences. The other arguments are generate()'s.
+        Nothing runs before the first ``next()``; ``close()`` stops after the sentence in flight.
+        Step and close it from one thread.
+        """
+        if duration is not None and not callable(duration):
+            raise TypeError("generate_streaming(): duration must be None or a callable (spoken text -> seconds)")
+        language = _resolve_language(language)  # one ID for normalize and generate(); unknown fails before TN
+        gen_config = replace(generation_config or OmniVoiceGenerationConfig(), **kwargs)  # a typo raises now
+        segments = _split_sentences(text)
+        if not any(c.isalnum() for c in text):
+            raise ValueError(f"text has nothing to speak: {text!r}")
+        for segment in segments if len(segments) == 1 else [s.strip() for s in segments]:
+            spoken = segment if normalize is None else normalize(segment, language)
+            if not any(c.isalnum() for c in spoken):  # TN emptied it ("<3" -> ""): nothing to say
+                continue
+            yield self.generate(spoken, language, instruct=instruct, speed=speed,
+                                duration=None if duration is None else duration(spoken),
+                                generation_config=gen_config, generator=generator)[0], segment
 
     def _decode_and_post_process(
         self,
@@ -1015,3 +1048,43 @@ def _combine_text(text, ref_text: str | None = None) -> str:
     full_text = re.sub(pattern, "", full_text)
 
     return full_text
+
+
+# ---- module level, next to _combine_text
+# A run of . ! ? … plus closing quotes/brackets, then whitespace, the end or a non-verbal tag; or 。！？.
+_SENTENCE_END = re.compile(r"[.!?…]+[\"'”’»)\]]*(?:\s+|$|(?=\[))|[。！？]+[”’」』）]*\s*")
+# Upstream's English list is shared with generate()'s >30 s chunker, so it stays untouched; Spanish is added here.
+_SENTENCE_ABBREVIATIONS = frozenset(ABBREVIATIONS | {"Sra.", "Srta.", "Dra.", "Lic.", "Ing.", "Av.", "Gral.", "Ud.",
+                                                     "Uds.", "EE.", "pág.", "Pág.", "aprox.", "núm.", "nro.", "Nro.",
+                                                     "tel."})
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split ``text`` after each sentence end, keeping every character (``"".join(result) == text``).
+
+    No split inside 3.5, 21:30, 1.500 or URLs (no whitespace follows), after a listed abbreviation or an
+    initial, or before a lowercase letter, also behind ¿ ¡ quotes or "(" ("Bueno... ¿qué?"). A piece with
+    nothing to say but non-verbal tags, punctuation or emoji joins the next piece; at the end, the previous one.
+    ponytail: Latin and CJK marks only; no split without whitespace after the mark ("¡Hola!¿Qué?"); the
+    abbreviation list is finite ("Bs. As.", "Sta. Fe" split: add entries when seen) and keeps upstream's
+    English "No." ("No. Mañana" merges); list markers ("1. Pizza") split like sentence ends; a one-letter
+    word before the mark ("¿Y?", "vitamina D.", "好。") merges; each skipped boundary re-scans from the
+    last split, O(n*k) on long texts without sentence ends.
+    """
+    pieces, start = [], 0
+    for m in _SENTENCE_END.finditer(text):
+        word = (text[start : m.start() + 1].split() or [""])[-1].lstrip("¿¡(\"'«“‘")
+        nxt = text[m.end() : m.end() + 8].lstrip("¿¡(\"'«“‘")[:1]  # first letter past opening marks
+        if nxt and (nxt.islower() or word in _SENTENCE_ABBREVIATIONS or (len(word) == 2 and word[0].isalpha())):
+            continue
+        pieces.append(text[start : m.end()])
+        start = m.end()
+    out = []
+    for piece in pieces + [text[start:]]:
+        if out and not any(c.isalnum() for c in _NONVERBAL_PATTERN.sub("", out[-1])):
+            out[-1] += piece
+        else:
+            out.append(piece)
+    if len(out) > 1 and not any(c.isalnum() for c in _NONVERBAL_PATTERN.sub("", out[-1])):
+        out[-2:] = [out[-2] + out[-1]]
+    return out

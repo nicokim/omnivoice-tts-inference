@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import re
+import stat
 import tempfile
 from importlib.metadata import version
 
@@ -263,12 +264,13 @@ def _spanish_nemo(cache_dir: str | None):
         f"es-cased-nemo{version('nemo_text_processing')}-pynini{version('pynini')}.pkl",
     )
     try:
-        # Unpickling runs code: only a regular file (not a symlink) that this user owns and
-        # nobody else can write. ponytail: POSIX only (os.getuid, O_NOFOLLOW); elsewhere
-        # the cache is never trusted and every start rebuilds.
-        with open(path, "rb", opener=lambda p, fl: os.open(p, fl | os.O_NOFOLLOW)) as f:
+        # Unpickling runs code: only a regular file (not a symlink; a FIFO cannot block the
+        # open) that this user owns and nobody else can write. ponytail: POSIX only
+        # (os.getuid, O_NOFOLLOW, O_NONBLOCK); elsewhere the cache is never trusted and
+        # every start rebuilds.
+        with open(path, "rb", opener=lambda p, fl: os.open(p, fl | os.O_NOFOLLOW | os.O_NONBLOCK)) as f:
             st = os.fstat(f.fileno())
-            if st.st_uid == os.getuid() and not st.st_mode & 0o022:
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022:
                 return pickle.load(f)
     except Exception:  # missing, corrupt, or written by another version: rebuild it
         pass

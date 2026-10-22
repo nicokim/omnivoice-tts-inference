@@ -1,11 +1,13 @@
 """TextNormalizer (§8). The tests commented "no NeMo" run without nemo-text-processing and never import it; the
 others skip without it."""
 
+import contextlib
 import hashlib
 import json
 import os
 import pickle
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -94,6 +96,26 @@ class Payload:
         return open, (self.mark, "w")
 
 
+class Hung(BaseException):
+    """Raised by ``deadline``: a BaseException, so the library's ``except Exception`` cannot swallow it."""
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Raise ``Hung`` in a call still blocked after ``seconds`` (SIGALRM interrupts a blocking ``open``)."""
+
+    def hung(signum, frame):
+        raise Hung(f"still blocked after {seconds} s")
+
+    old = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def test_cache_loads_only_own_private_pickle(tmp_path, monkeypatch):  # no NeMo
     fake = types.ModuleType("nemo_text_processing.text_normalization.normalize")
     fake.Normalizer = FakeNormalizer
@@ -125,16 +147,26 @@ def test_cache_loads_only_own_private_pickle(tmp_path, monkeypatch):  # no NeMo
     payload.chmod(0o600)
     pickle.loads(payload.read_bytes()).close()  # the payload works: unpickling it creates mark
     mark.unlink()
-    for planted in ("0664", "0646", "symlink", "corrupt"):
+    for planted in ("0664", "0646", "symlink", "corrupt", "fifo", "fed fifo"):
         path.unlink()
+        writer = None
         if planted == "symlink":
             path.symlink_to(payload)  # a regular 0600 file this user owns, behind a link
+        elif planted.endswith("fifo"):  # 0600 and this user's, but not a regular file
+            os.mkfifo(path, 0o600)
+            if planted == "fed fifo":  # the payload queued in it, behind an open writer
+                writer = os.open(path, os.O_RDWR)
+                os.write(writer, payload.read_bytes())
         else:
             path.write_bytes(b"corrupt" if planted == "corrupt" else payload.read_bytes())
             path.chmod(0o600 if planted == "corrupt" else int(planted, 8))
         builds = FakeNormalizer.builds
-        assert isinstance(load(), FakeNormalizer) and FakeNormalizer.builds == builds + 1, planted  # rebuilt
-        assert not mark.exists() and not path.is_symlink() and mode(path) == 0o600, planted
+        with deadline(10):  # opening a FIFO nobody writes waits for a writer, unless O_NONBLOCK
+            got = load()
+        if writer is not None:
+            os.close(writer)
+        assert isinstance(got, FakeNormalizer) and FakeNormalizer.builds == builds + 1, planted  # rebuilt
+        assert not mark.exists() and path.is_file() and not path.is_symlink() and mode(path) == 0o600, planted
     assert [p.name for p in cache.iterdir()] == [path.name]  # no .tmp file left behind
 
     monkeypatch.setattr(fake, "Normalizer", None)  # the build itself fails

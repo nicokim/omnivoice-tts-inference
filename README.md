@@ -428,8 +428,8 @@ FlashInfer + int8 is `apply_int8(apply_flashinfer(model)).to("cuda:0")`. Then ma
   `apply_flashinfer` after `apply_int8` raises `TypeError`. `apply_flashinfer` raises `ValueError` without CUDA or
   with fp32 weights. `import omnivoice_tts` imports neither module.
 - After FlashInfer, only `generate()` and `generate_streaming()` may drive the model, one call at a time per instance.
-  Its output is not bit-identical to sdpa's. Judged on KohAI with the emulation below, it was undetectable against
-  sdpa on a 124-line paired evaluation (13 metrics), and no difference was heard in 9 blind-listening pairs.
+  Its output is not bit-identical to sdpa's. Judged on KohAI, it was undetectable against sdpa on a 124-line paired
+  evaluation (13 metrics, two seeds), and no difference was heard in 9 blind-listening pairs.
 - int8 stores every `nn.Linear` of the LLM's decoder layers as an int8 weight with one scale per output channel, and
   dequantizes it on each call. Embeddings, audio heads, norms and the codec stay as loaded. Its output is not
   bit-identical to fp16, and a quantized model cannot be saved.
@@ -465,22 +465,23 @@ On GPUs with compute capability 12.x, such as the RTX 50 series, start Python wi
 `FLASHINFER_CUDA_ARCH_LIST=12.0a` (the `+cu128` wheel) or `FLASHINFER_CUDA_ARCH_LIST=12.0f` (`+cu129`) in its
 environment. When FlashInfer finds no arch it can build or load for the GPU, `apply_flashinfer` raises a
 `RuntimeError` that names the variable, before it patches anything. The library never sets environment variables.
-The measured stack is cu129 with `12.0f`. The cu128 route with `12.0a` was checked on the library as well: on an RTX
-5090 both routes patch the model and give bit-identical audio on 12 KohAI lines.
+Both routes were measured on the library on an RTX 5090: they patch the model, give bit-identical audio on 12 KohAI
+lines and run within 3 % of each other. The table below is cu128 with `12.0a`.
 
-**Measured on an emulation of the library, to re-measure.** The emulation is upstream's code with this library's
-changes applied (decode-only codec, `use_cache=False`, CPU-first patching), on an RTX 5090 with fp16 weights, 32 steps
-and batch 1. "Resident" is the allocated memory after loading and the warm-up call, and includes the FlashInfer
-runner. "Peak" is the allocated peak of a call on a text of up to about 6 s and on a 20 s text. "nvidia-smi" is the
-process after the short texts, "RTF" is over 12 short KohAI lines, and the last column is the time to the first
-stream item of a typical KohAI reply.
+**Measured on the library**, on an RTX 5090 with fp16 weights, 32 steps and batch 1 (torch 2.8 with CUDA 12.8 and
+PyTorch's default CUDA allocator). "Resident" is the allocated memory after loading and the warm-up call, and
+includes the FlashInfer runner. "Peak" is the allocated peak of a call on a text of up to about 6 s and on a 20 s
+text. "nvidia-smi" is the process after the short texts, "RTF" is over 12 short KohAI lines (the range over fresh
+processes), and the last column is the median time to the first stream item over 20 KohAI replies of 2-4 sentences,
+before text normalization, which adds about 10 ms. Timings move with the machine's other load: in a quieter session
+the same work ran 2-10 % faster (RTF 0.053, 0.057, 0.023-0.024 and 0.031).
 
 | | resident GiB | peak GiB, ≤ 6 s / 20 s text | nvidia-smi MiB | RTF | first sentence of a typical reply |
 |---|---|---|---|---|---|
-| sdpa fp16 | 1.23 | 1.33 / 1.56 | 2,014 | 0.053 | 240 ms |
-| sdpa int8 | 0.82 | 0.92 / 1.15 | 1,612 | 0.057 | 268 ms |
-| FlashInfer fp16 | 1.36 | 1.46 / 1.69 | 2,154 | 0.023-0.024 | 103 ms |
-| FlashInfer + int8 | 0.95 | 1.05 / 1.28 | 1,754 | 0.031 | 119 ms |
+| sdpa fp16 | 1.23 | 1.33 / 1.56 | 2,050 | 0.054-0.057 | 261 ms |
+| sdpa int8 | 0.83 | 0.93 / 1.16 | 1,650 | 0.058-0.059 | 283 ms |
+| FlashInfer fp16 | 1.37 | 1.47 / 1.70 | 2,242 | 0.024-0.025 | 111 ms |
+| FlashInfer + int8 | 0.96 | 1.06 / 1.29 | 1,768 | 0.034 | 135 ms |
 
 `scripts/benchmark.py`, in the repository but not the package, measures memory, load time, the cold call, the first
 stream item and a 29 s paragraph's RTF on the library (`--backend sdpa|flashinfer`, `--int8`).
@@ -488,16 +489,17 @@ stream item and a 29 s paragraph's RTF on the library (`--backend sdpa|flashinfe
 When to use which:
 
 - FlashInfer fp16 is the fastest, and the best neighbor for an LLM on the same GPU.
-- int8 trades 0.41 GiB for +8 % (sdpa) or +31-34 % (FlashInfer) time per call, and costs a co-located LLM more of its
-  decode. Use it only when GPU memory is the constraint.
+- int8 trades 0.41 GiB for +5-8 % (sdpa) or +31-40 % (FlashInfer) time per call, and costs a co-located LLM more of
+  its decode. Use it only when GPU memory is the constraint.
 
 Both int8 configs passed a blind listening on KohAI: no difference heard in 19 of 20 pairs, and int8 preferred in the
 other.
 
 ## Next to an LLM and faster-whisper
 
-This is kohai-v3's case: the TTS, an LLM server and faster-whisper on one GPU. The figures were measured on the
-emulation of the library above, with llama-server and faster-whisper on the same GPU.
+This is kohai-v3's case: the TTS, an LLM server and faster-whisper on one GPU. The figures were measured on an
+emulation of the library (upstream's code with this library's changes applied), with llama-server and faster-whisper
+on the same GPU.
 
 - The processes share the GPU by time-slicing (inferred). A TTS call takes 1.12-1.34× as long while the LLM decodes,
   and the LLM keeps 23-34 % of its decode speed while the TTS runs. FlashInfer fp16 costs the LLM the least per

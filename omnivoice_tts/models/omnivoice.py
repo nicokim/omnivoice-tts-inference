@@ -37,16 +37,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import snapshot_download
+from huggingface_hub.utils import tqdm as hf_tqdm
+from safetensors import safe_open
 from transformers import (
-    AutoFeatureExtractor,
-    AutoModel,
     AutoTokenizer,
+    HiggsAudioV2TokenizerConfig,
     HiggsAudioV2TokenizerModel,
     PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.modeling_outputs import ModelOutput
-from transformers.models.auto import CONFIG_MAPPING, AutoConfig
+from transformers.models.auto import CONFIG_MAPPING, MODEL_MAPPING, AutoConfig
 
 from omnivoice_tts.utils.audio import (
     cross_fade_chunks,
@@ -117,10 +119,10 @@ class OmniVoiceConfig(PretrainedConfig):
         audio_vocab_size: int = 1025,
         audio_mask_id: int = 1024,
         num_audio_codebook: int = 8,
-        audio_codebook_weights: list[float] | None = None,
         llm_config: dict | PretrainedConfig | None = None,
         **kwargs,
     ):
+        # training-only keys in config.json (audio_codebook_weights) still load as attributes, through **kwargs
         if isinstance(llm_config, dict):
             llm_config = CONFIG_MAPPING[llm_config["model_type"]](**llm_config)
 
@@ -130,17 +132,54 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_vocab_size = audio_vocab_size
         self.audio_mask_id = audio_mask_id
         self.num_audio_codebook = num_audio_codebook
-        if audio_codebook_weights is None:
-            audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
-        self.audio_codebook_weights = audio_codebook_weights
 
 
-def _resolve_model_path(name_or_path: str) -> str:
+_MODEL_FILES = ["*.json", "*.txt", "model.safetensors", "audio_tokenizer/*"]
+# the codec k2-fsa ships in audio_tokenizer/: the fallback for repos without one
+_CODEC_REPO, _CODEC_REVISION = "eustlb/higgs-audio-v2-tokenizer", "528e871c2a26c4f0f7773b9754e2e1acae20899d"
+_CODEC_ENCODER = ("acoustic_encoder", "encoder_semantic", "decoder_semantic", "semantic_model", "fc", "fc1")
+_CODEC_DECODER = ("quantizer.", "fc2.", "acoustic_decoder.")  # all that HiggsAudioV2TokenizerModel.decode() uses
+
+
+class _NoBar(hf_tqdm):
+    """No progress bar for this download only (HF_HUB_DISABLE_PROGRESS_BARS would be process-wide)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **{**kwargs, "disable": True})
+
+
+def _resolve_model_path(name_or_path: str, allow_patterns: list[str], revision: str | None = None, **hub) -> str:
     if os.path.isdir(name_or_path):
         return name_or_path
-    from huggingface_hub import snapshot_download
+    return snapshot_download(name_or_path, revision=revision, allow_patterns=allow_patterns, tqdm_class=_NoBar, **hub)
 
-    return snapshot_download(name_or_path)
+
+def _load_safetensors(
+    module: nn.Module,
+    path: str,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+    prefixes: tuple[str, ...] | None = None,
+) -> None:
+    """Strict assign-load into a meta-built module; only floating checkpoint tensors are cast to ``dtype``."""
+    sd = {}
+    with safe_open(path, framework="pt") as f:
+        for k in f.keys():
+            if prefixes is None or k.startswith(prefixes):
+                t = f.get_tensor(k)
+                sd[k] = t.to(device, dtype if dtype is not None and t.is_floating_point() else t.dtype)
+    module.load_state_dict(sd, strict=True, assign=True)
+
+
+def _load_decode_only_codec(path: str, device: torch.device) -> HiggsAudioV2TokenizerModel:
+    """The Higgs codec without its encoders, in the checkpoint's dtype; ``encode()`` is not available."""
+    config = HiggsAudioV2TokenizerConfig.from_pretrained(path)
+    with torch.device("meta"):
+        codec = HiggsAudioV2TokenizerModel(config)  # __init__ keeps _adjust_dac_decoder (output_padding, no tanh)
+    for name in _CODEC_ENCODER:
+        delattr(codec, name)
+    _load_safetensors(codec, os.path.join(path, "model.safetensors"), device, prefixes=_CODEC_DECODER)
+    return codec.eval()
 
 
 class OmniVoice(PreTrainedModel):
@@ -150,7 +189,8 @@ class OmniVoice(PreTrainedModel):
     def __init__(self, config: OmniVoiceConfig):
         super().__init__(config)
 
-        self.llm = AutoModel.from_config(self.config.llm_config)
+        # the model class itself: AutoModel.from_config writes the process default dtype while it builds
+        self.llm = MODEL_MAPPING[type(config.llm_config)](config.llm_config)
 
         self.audio_embeddings = nn.Embedding(
             config.num_audio_codebook * config.audio_vocab_size,
@@ -169,55 +209,73 @@ class OmniVoice(PreTrainedModel):
 
         self.post_init()
 
-        # Inference-only attributes (set by from_pretrained when not in train mode)
+        # Inference-only attributes, set by from_pretrained; generate() refuses to run while they are None
         self.text_tokenizer = None
         self.audio_tokenizer = None
         self.duration_estimator = None
         self.sampling_rate = None
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
-        train_mode = kwargs.pop("train", False)
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *,
+        device_map: str | int | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        revision: str | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | None = None,
+        local_files_only: bool = False,
+    ) -> "OmniVoice":
+        """Load the model, its text tokenizer and a decode-only audio codec, in eval mode.
 
-        # Suppress noisy INFO logs from transformers/huggingface_hub during loading
-        _prev_disable = logging.root.manager.disable
-        logging.disable(logging.INFO)
+        Everything after the path is keyword-only, and an unknown keyword (upstream's ``train``,
+        ``load_asr``, ``torch_dtype``, ...) raises ``TypeError``.
 
-        try:
-            # Resolve to local path first; download only if not already cached
-            resolved_path = _resolve_model_path(pretrained_model_name_or_path)
+        Args:
+            pretrained_model_name_or_path: A local directory, used as is, or a Hub repo id.
+            device_map: One device (str, int or ``torch.device``); ``None`` means CPU. ``"auto"``,
+                ``"balanced"``, ``"balanced_low_0"``, ``"sequential"`` and dicts raise ``ValueError``.
+                The codec goes to CPU when the model is on MPS.
+            dtype: ``None`` means the config's dtype (and the checkpoint's own dtypes when the config
+                names none). RoPE's ``inv_freq`` stays fp32 and the codec keeps its checkpoint dtype.
+            revision, token, cache_dir, local_files_only: Passed to ``snapshot_download``, also for the
+                codec fallback (``eustlb/higgs-audio-v2-tokenizer`` at a pinned revision) that a repo
+                without ``audio_tokenizer/`` uses.
 
-            model = super().from_pretrained(resolved_path, *args, **kwargs)
+        The checkpoint is a single ``model.safetensors`` (sharded ones are not supported); its keys must
+        match the model exactly.
 
-            if not train_mode:
-                model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
-
-                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
-
-                if not os.path.isdir(audio_tokenizer_path):
-                    audio_tokenizer_path = _resolve_model_path(
-                        "eustlb/higgs-audio-v2-tokenizer"
-                    )
-
-                # higgs-audio-v2-tokenizer does not support MPS
-                # (output channels > 65536)
-                tokenizer_device = (
-                    "cpu" if str(model.device).startswith("mps") else model.device
-                )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
-
-                model.sampling_rate = model.feature_extractor.sampling_rate
-
-                model.duration_estimator = RuleDurationEstimator()
-        finally:
-            logging.disable(_prev_disable)
-
-        return model
+        Never call ``.half()`` or ``.to(dtype)`` after loading: they also cast the fp32 RoPE buffers and
+        the codec. Pass ``dtype=`` instead.
+        """
+        if isinstance(device_map, dict) or device_map in ("auto", "balanced", "balanced_low_0", "sequential"):
+            raise ValueError(f"device_map must be one device (str, int or torch.device), got {device_map!r}")
+        device = torch.device("cpu" if device_map is None else device_map)
+        hub = dict(token=token, cache_dir=cache_dir, local_files_only=local_files_only)
+        path = _resolve_model_path(pretrained_model_name_or_path, _MODEL_FILES, revision, **hub)
+        config = OmniVoiceConfig.from_pretrained(path)
+        with torch.device("meta"):  # no allocation, no random init, no RNG draw
+            model = cls(config)
+        _load_safetensors(
+            model, os.path.join(path, "model.safetensors"), device, dtype if dtype is not None else config.dtype
+        )
+        # inv_freq is a non-persistent fp32 buffer, not in the checkpoint: rebuilt on CPU, then moved, as
+        # transformers' from_pretrained does
+        model.llm.rotary_emb = type(model.llm.rotary_emb)(model.llm.config).to(device)
+        model.text_tokenizer = AutoTokenizer.from_pretrained(path, config=config)  # config=: silent, no Auto registry
+        codec_path = os.path.join(path, "audio_tokenizer")
+        if not os.path.isdir(codec_path):
+            codec_path = _resolve_model_path(_CODEC_REPO, ["config.json", "model.safetensors"], _CODEC_REVISION, **hub)
+        # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
+        model.audio_tokenizer = _load_decode_only_codec(
+            codec_path, torch.device("cpu") if device.type == "mps" else device
+        )
+        if any(t.is_meta for t in (*model.parameters(), *model.buffers())):
+            raise RuntimeError("tensors left on the meta device after loading (unsupported transformers version?)")
+        model.sampling_rate = model.audio_tokenizer.config.sample_rate
+        model.duration_estimator = RuleDurationEstimator()
+        return model.eval()
 
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
@@ -957,11 +1015,3 @@ def _combine_text(text, ref_text: str | None = None) -> str:
     full_text = re.sub(pattern, "", full_text)
 
     return full_text
-
-
-# ---------------------------------------------------------------------------
-# Register with HuggingFace Auto classes
-# ---------------------------------------------------------------------------
-
-AutoConfig.register("omnivoice", OmniVoiceConfig)
-AutoModel.register(OmniVoiceConfig, OmniVoice)

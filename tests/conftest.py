@@ -1,5 +1,6 @@
 """Tiny random models for the CPU tests: a Qwen3 LLM, a word-level tokenizer and a Higgs codec."""
 
+import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import HiggsAudioV2TokenizerConfig, HiggsAudioV2TokenizerModel, PreTrainedTokenizerFast
@@ -43,6 +44,20 @@ def tiny_model(dtype=torch.float32):
     m.text_tokenizer, m.audio_tokenizer, m.duration_estimator = tiny_tokenizer(), tiny_codec(), RuleDurationEstimator()
     m.sampling_rate = m.audio_tokenizer.config.sample_rate
     return m
+
+
+@pytest.fixture(scope="session")
+def tiny_dir(tmp_path_factory):
+    """A checkpoint dir as from_pretrained reads it: config.json, model.safetensors (seed 0, saved without a codec),
+    the tokenizer files and audio_tokenizer/."""
+    d = tmp_path_factory.mktemp("tiny")
+    torch.manual_seed(0)
+    # llm_config names its dtype, as in the KohAI and k2-fsa checkpoints: building the LLM with AutoModel.from_config
+    # would then write the process default dtype
+    OmniVoice(OmniVoiceConfig(llm_config={**TINY_LLM, "dtype": "float32"})).save_pretrained(d)
+    tiny_tokenizer().save_pretrained(d)
+    tiny_codec().save_pretrained(d / "audio_tokenizer")
+    return d
 
 
 def cfg_batch():
